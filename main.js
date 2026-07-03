@@ -1,0 +1,1921 @@
+const {
+  ItemView,
+  MarkdownRenderer,
+  Menu,
+  Modal,
+  Notice,
+  Plugin,
+  PluginSettingTab,
+  Setting,
+  setIcon,
+} = require("obsidian");
+
+const VIEW_TYPE = "obsidian-tasks-kanban-view";
+const CARD_FOLDER = "Kanban Cards";
+const LIST_DRAG_TYPE = "application/x-obsidian-tasks-kanban-list";
+const DONATION_URL = "https://buymeacoffee.com/carbon06";
+const DEFAULT_LABEL_COLOR = "#2f6fd6";
+const LABEL_COLORS = [
+  "#1f6f4a", "#8a6f00", "#a64b00", "#8b2a24", "#6f338f",
+  "#247b55", "#9a7600", "#b85f00", "#be332b", "#8a3db0",
+  "#54c99b", "#e5bd12", "#ffa51a", "#f46b66", "#c878ee",
+  "#1b4078", "#1f7082", "#426226", "#67264f", "#5d6369",
+  "#2465c7", "#2b7c8e", "#4f7822", "#a33e78", "#73787f",
+  "#68a0ee", "#70c1d8", "#96c949", "#dc6ab5", "#a3a6aa",
+];
+
+const DEFAULT_DATA = {
+  version: 1,
+  activeBoardId: "default",
+  boards: [
+    {
+      id: "default",
+      name: "Task Deck",
+      lists: [],
+    },
+  ],
+  cards: {},
+  labels: [],
+};
+
+function clone(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function uid(prefix) {
+  return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function textLine(value) {
+  return String(value || "").replace(/\r?\n/g, " ").trim();
+}
+
+function cleanDate(value) {
+  const date = textLine(value);
+  return /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : "";
+}
+
+function dateFromISO(value) {
+  const date = cleanDate(value);
+  if (!date) return null;
+
+  const [year, month, day] = date.split("-").map(Number);
+  return new Date(year, month - 1, day);
+}
+
+function isoFromDate(date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function addMonths(date, amount) {
+  return new Date(date.getFullYear(), date.getMonth() + amount, 1);
+}
+
+function shortDateLabel(value) {
+  const date = dateFromISO(value);
+  if (!date) return "";
+
+  return new Intl.DateTimeFormat(undefined, { day: "numeric", month: "short" })
+    .format(date)
+    .replace(/\.$/, "");
+}
+
+function fieldDateLabel(value) {
+  const date = dateFromISO(value);
+  if (!date) return "D.M.YYYY";
+
+  const day = String(date.getDate()).padStart(2, "0");
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  return `${day}.${month}.${date.getFullYear()}`;
+}
+
+function dateRangeLabel(startDate, dueDate) {
+  const start = cleanDate(startDate);
+  const due = cleanDate(dueDate);
+  if (start && due && start !== due) return `${shortDateLabel(start)} - ${shortDateLabel(due)}`;
+  return shortDateLabel(due || start);
+}
+
+function parseBoolean(value) {
+  const normalized = textLine(value).toLowerCase();
+  return ["true", "yes", "1", "x", "done"].includes(normalized);
+}
+
+function labelKey(label) {
+  return textLine(typeof label === "string" ? label : label && label.name).toLowerCase();
+}
+
+function cleanLabelName(label) {
+  const name = textLine(typeof label === "string" ? label : label && label.name);
+  return name === "---" ? "" : name;
+}
+
+function slugify(value) {
+  const slug = String(value || "card")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 64);
+
+  return slug || "card";
+}
+
+function createElement(tag, className, text) {
+  const element = document.createElement(tag);
+  if (className) element.className = className;
+  if (text !== undefined) element.textContent = text;
+  return element;
+}
+
+function hasDragType(event, type) {
+  const types = event.dataTransfer && event.dataTransfer.types;
+  return !!types && (Array.from(types).includes(type) || (types.contains && types.contains(type)));
+}
+
+function iconButton(icon, label, onClick) {
+  const button = createElement("button", "ot-icon-button");
+  button.type = "button";
+  button.title = label;
+  button.setAttribute("aria-label", label);
+  try {
+    setIcon(button, icon);
+  } catch (error) {
+    button.textContent = label;
+  }
+  button.addEventListener("click", onClick);
+  return button;
+}
+
+function textButton(icon, label, onClick) {
+  const button = createElement("button", "ot-text-button");
+  button.type = "button";
+
+  const iconSlot = createElement("span", "ot-button-icon");
+  try {
+    setIcon(iconSlot, icon);
+  } catch (error) {
+    iconSlot.textContent = "+";
+  }
+
+  button.append(iconSlot, createElement("span", "", label));
+  button.addEventListener("click", onClick);
+  return button;
+}
+
+function getSection(markdown, heading) {
+  const marker = `## ${heading}`;
+  const start = markdown.indexOf(marker);
+  if (start === -1) return "";
+
+  const body = markdown.slice(start + marker.length);
+  const nextHeading = body.search(/\n## /);
+  return (nextHeading === -1 ? body : body.slice(0, nextHeading)).trim();
+}
+
+function getSectionAny(markdown, headings) {
+  for (const heading of headings) {
+    const section = getSection(markdown, heading);
+    if (section) return section;
+  }
+  return "";
+}
+
+function parseChecklist(text) {
+  return String(text || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const match = line.match(/^(?:-\s*)?\[([ xX])\]\s*(.*)$/);
+      if (!match) {
+        return { done: false, text: line.replace(/^- /, "").trim() };
+      }
+
+      return {
+        done: match[1].toLowerCase() === "x",
+        text: match[2].trim(),
+      };
+    })
+    .filter((item) => item.text);
+}
+
+function checklistToText(items) {
+  return (items || [])
+    .map((item) => `[${item.done ? "x" : " "}] ${item.text}`)
+    .join("\n");
+}
+
+function checklistToMarkdown(items) {
+  return (items || [])
+    .map((item) => `- [${item.done ? "x" : " "}] ${textLine(item.text)}`)
+    .join("\n");
+}
+
+function checklistStats(items) {
+  const total = (items || []).length;
+  const done = (items || []).filter((item) => item.done).length;
+  return {
+    done,
+    total,
+    percent: total ? Math.round((done / total) * 100) : 0,
+  };
+}
+
+function parseLabels(raw) {
+  return String(raw || "")
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part) => {
+      const [name, color] = part.split("|").map((item) => item.trim());
+      return { name, color: color || "#d43c35" };
+    })
+    .filter((label) => label.name);
+}
+
+function labelsToFrontmatter(labels) {
+  return (labels || [])
+    .map((label) => `${textLine(label.name)}|${textLine(label.color || "#d43c35")}`)
+    .join(", ");
+}
+
+function parseCardMarkdown(markdown) {
+  const idMatch = markdown.match(/^kanban-card-id:\s*(.*)$/m);
+  const boardMatch = markdown.match(/^kanban-board-id:\s*(.*)$/m);
+  const listMatch = markdown.match(/^kanban-list-id:\s*(.*)$/m);
+  const titleMatch = markdown.match(/^#\s+(.+)$/m);
+  const labelsMatch = markdown.match(/^labels:\s*(.*)$/m);
+  const completedMatch = markdown.match(/^completed:\s*(.*)$/m);
+  const startMatch = markdown.match(/^start:\s*(.*)$/m);
+  const dueMatch = markdown.match(/^due:\s*(.*)$/m);
+
+  return {
+    id: idMatch ? textLine(idMatch[1]) : "",
+    boardId: boardMatch ? textLine(boardMatch[1]) : "",
+    listId: listMatch ? textLine(listMatch[1]) : "",
+    title: titleMatch ? titleMatch[1].trim() : "",
+    labels: labelsMatch ? parseLabels(labelsMatch[1]) : [],
+    completed: completedMatch ? parseBoolean(completedMatch[1]) : null,
+    startDate: startMatch ? cleanDate(startMatch[1]) : null,
+    dueDate: dueMatch ? cleanDate(dueMatch[1]) : null,
+    details: getSectionAny(markdown, ["Details", "Detaylar"]),
+    checklist: parseChecklist(getSectionAny(markdown, ["Checklist", "Yapılacaklar", "Kontrol listesi"])),
+  };
+}
+
+class TextPromptModal extends Modal {
+  constructor(app, title, placeholder, initialValue, onSubmit) {
+    super(app);
+    this.title = title;
+    this.placeholder = placeholder;
+    this.initialValue = initialValue || "";
+    this.onSubmit = onSubmit;
+  }
+
+  onOpen() {
+    this.contentEl.replaceChildren();
+    this.contentEl.addClass("ot-prompt-modal");
+
+    this.contentEl.append(createElement("h2", "", this.title));
+
+    const input = createElement("input", "ot-input");
+    input.type = "text";
+    input.placeholder = this.placeholder;
+    input.value = this.initialValue;
+    this.contentEl.append(input);
+
+    const actions = createElement("div", "ot-modal-actions");
+    const cancel = createElement("button", "", "Cancel");
+    const save = createElement("button", "mod-cta", "Save");
+    cancel.type = "button";
+    save.type = "button";
+
+    cancel.addEventListener("click", () => this.close());
+    save.addEventListener("click", () => this.submit(input.value));
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") this.submit(input.value);
+    });
+
+    actions.append(cancel, save);
+    this.contentEl.append(actions);
+
+    requestAnimationFrame(() => input.focus());
+  }
+
+  submit(value) {
+    const cleanValue = textLine(value);
+    if (!cleanValue) {
+      new Notice("Name cannot be empty.");
+      return;
+    }
+
+    this.onSubmit(cleanValue);
+    this.close();
+  }
+}
+
+class LabelPickerModal extends Modal {
+  constructor(app, labels, selectedLabels, onChange) {
+    super(app);
+    this.labels = clone(labels || []);
+    this.selectedLabels = clone(selectedLabels || []);
+    this.onChange = onChange;
+    this.creating = false;
+    this.editingKey = null;
+    this.query = "";
+    this.createName = "";
+    this.createColor = DEFAULT_LABEL_COLOR;
+  }
+
+  onOpen() {
+    this.render();
+  }
+
+  isSelected(label) {
+    const key = labelKey(label);
+    return this.selectedLabels.some((item) => labelKey(item) === key);
+  }
+
+  emitChange() {
+    this.onChange(clone(this.labels), clone(this.selectedLabels));
+  }
+
+  dedupeLabels(labels) {
+    const seen = new Set();
+    return (labels || []).filter((label) => {
+      const key = labelKey(label);
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
+
+  toggleLabel(label) {
+    if (this.isSelected(label)) {
+      this.selectedLabels = this.selectedLabels.filter((item) => labelKey(item) !== labelKey(label));
+    } else {
+      this.selectedLabels.push(clone(label));
+    }
+    this.emitChange();
+    this.render();
+  }
+
+  createLabel(name, color) {
+    const cleanName = textLine(name);
+    if (!cleanName) return;
+
+    const label = { name: cleanName, color: color || DEFAULT_LABEL_COLOR };
+    if (this.editingKey) {
+      const oldKey = this.editingKey;
+      const update = (item) => (labelKey(item) === oldKey ? clone(label) : item);
+      this.labels = this.dedupeLabels(this.labels.map(update));
+      this.selectedLabels = this.dedupeLabels(this.selectedLabels.map(update));
+    } else {
+      const existing = this.labels.find((item) => labelKey(item) === labelKey(cleanName));
+      const nextLabel = existing || label;
+      if (!existing) this.labels.push(nextLabel);
+      if (!this.isSelected(nextLabel)) this.selectedLabels.push(clone(nextLabel));
+    }
+
+    this.creating = false;
+    this.editingKey = null;
+    this.query = "";
+    this.createName = "";
+    this.createColor = DEFAULT_LABEL_COLOR;
+    this.emitChange();
+    this.render();
+  }
+
+  editLabel(label) {
+    this.creating = true;
+    this.editingKey = labelKey(label);
+    this.createName = label.name;
+    this.createColor = label.color || DEFAULT_LABEL_COLOR;
+    this.render();
+  }
+
+  render() {
+    this.contentEl.replaceChildren();
+    this.contentEl.addClass("ot-label-modal");
+
+    if (this.creating) {
+      this.renderCreateScreen();
+      return;
+    }
+
+    const header = createElement("div", "ot-label-modal-header");
+    header.append(createElement("h2", "", "Labels"));
+
+    const search = createElement("input", "ot-label-search");
+    search.type = "text";
+    search.placeholder = "Search labels";
+    search.value = this.query;
+    search.addEventListener("input", () => {
+      this.query = search.value;
+      renderList();
+    });
+
+    const labelTitle = createElement("h3", "ot-label-modal-subtitle", "Labels");
+    const list = createElement("div", "ot-label-picker-list");
+    const createArea = createElement("div", "ot-label-create-area");
+
+    const renderList = () => {
+      const query = this.query.trim().toLowerCase();
+      list.replaceChildren();
+
+      this.labels
+        .filter((label) => !query || label.name.toLowerCase().includes(query))
+        .forEach((label) => {
+          const row = createElement("div", "ot-label-option-row");
+          const checkbox = createElement("input");
+          checkbox.type = "checkbox";
+          checkbox.checked = this.isSelected(label);
+
+          const labelButton = createElement("button", "ot-label-option", label.name);
+          labelButton.type = "button";
+          labelButton.style.backgroundColor = label.color || "#2f6fd6";
+
+          const edit = iconButton("pencil", "Edit label", (event) => {
+            event.stopPropagation();
+            this.editLabel(label);
+          });
+
+          checkbox.addEventListener("change", () => this.toggleLabel(label));
+          labelButton.addEventListener("click", () => this.toggleLabel(label));
+          row.append(checkbox, labelButton, edit);
+          list.append(row);
+        });
+    };
+
+    const renderCreateArea = () => {
+      createArea.replaceChildren();
+
+      const create = createElement("button", "ot-label-create-button", "Create new label");
+      create.type = "button";
+      create.addEventListener("click", () => {
+        this.creating = true;
+        this.editingKey = null;
+        this.createName = this.query;
+        this.createColor = DEFAULT_LABEL_COLOR;
+        this.render();
+      });
+      createArea.append(create);
+    };
+
+    this.contentEl.append(header, search, labelTitle, list, createArea);
+    renderList();
+    renderCreateArea();
+    requestAnimationFrame(() => search.focus());
+  }
+
+  renderCreateScreen() {
+    const header = createElement("div", "ot-label-modal-header");
+    const back = iconButton("arrow-left", "Back", () => {
+      this.creating = false;
+      this.editingKey = null;
+      this.render();
+    });
+    back.classList.add("ot-label-back");
+    header.append(back, createElement("h2", "", this.editingKey ? "Edit label" : "Create label"));
+
+    const previewBand = createElement("div", "ot-label-create-preview-band");
+    const preview = createElement("div", "ot-label-preview-pill", this.createName || "Label preview");
+    preview.style.backgroundColor = this.createColor;
+    previewBand.append(preview);
+
+    const form = createElement("form", "ot-label-create-screen");
+    const titleField = createElement("label", "ot-field");
+    titleField.append(createElement("span", "", "Title"));
+    const title = createElement("input", "ot-label-create-title");
+    title.type = "text";
+    title.value = this.createName;
+    title.placeholder = "Label name";
+    titleField.append(title);
+
+    const colorField = createElement("div", "ot-field");
+    colorField.append(createElement("span", "", "Choose color"));
+    const swatches = createElement("div", "ot-label-color-grid");
+    LABEL_COLORS.forEach((color) => {
+      const swatch = createElement("button", "ot-label-color-swatch");
+      swatch.type = "button";
+      swatch.style.backgroundColor = color;
+      swatch.setAttribute("aria-label", color);
+      if (color === this.createColor) {
+        swatch.classList.add("is-selected");
+        try {
+          setIcon(swatch, "check");
+        } catch (error) {
+          swatch.textContent = "✓";
+        }
+      }
+      swatch.addEventListener("click", () => {
+        this.createColor = color;
+        this.render();
+      });
+      swatches.append(swatch);
+    });
+    colorField.append(swatches);
+
+    const removeColor = textButton("x", "Remove color", () => {
+      this.createColor = "#6f737a";
+      this.render();
+    });
+    removeColor.classList.add("ot-remove-color-button");
+
+    const footer = createElement("div", "ot-label-create-footer");
+    const create = createElement("button", "mod-cta", this.editingKey ? "Save" : "Create");
+    create.type = "submit";
+    footer.append(create);
+
+    title.addEventListener("input", () => {
+      this.createName = title.value;
+      preview.textContent = this.createName || "Label preview";
+    });
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      this.createLabel(title.value, this.createColor);
+    });
+
+    form.append(titleField, colorField, removeColor, footer);
+    this.contentEl.append(header, previewBand, form);
+    requestAnimationFrame(() => title.focus());
+  }
+}
+
+class CardDatesModal extends Modal {
+  constructor(app, plugin, cardId) {
+    super(app);
+    this.plugin = plugin;
+    this.cardId = cardId;
+    this.activeField = "due";
+    this.startDate = "";
+    this.dueDate = "";
+    this.visibleMonth = new Date();
+  }
+
+  onOpen() {
+    const card = this.plugin.data.cards[this.cardId];
+    if (!card) {
+      this.close();
+      return;
+    }
+
+    this.card = card;
+    this.startDate = cleanDate(card.startDate);
+    this.dueDate = cleanDate(card.dueDate);
+    this.activeField = this.startDate && !this.dueDate ? "start" : "due";
+    const seed = dateFromISO(this.dueDate || this.startDate) || new Date();
+    this.visibleMonth = new Date(seed.getFullYear(), seed.getMonth(), 1);
+    this.render();
+  }
+
+  render() {
+    this.contentEl.replaceChildren();
+    this.contentEl.addClass("ot-date-modal");
+    this.contentEl.append(createElement("h2", "", "Dates"));
+
+    this.contentEl.append(this.renderCalendar(), this.renderDateFields(), this.renderActions());
+  }
+
+  renderCalendar() {
+    const calendar = createElement("div", "ot-date-calendar");
+    const nav = createElement("div", "ot-date-calendar-nav");
+    const title = createElement("div", "ot-date-month-title");
+    title.textContent = new Intl.DateTimeFormat(undefined, { month: "long", year: "numeric" }).format(this.visibleMonth);
+
+    nav.append(
+      iconButton("chevrons-left", "Previous year", () => {
+        this.visibleMonth = addMonths(this.visibleMonth, -12);
+        this.render();
+      }),
+      iconButton("chevron-left", "Previous month", () => {
+        this.visibleMonth = addMonths(this.visibleMonth, -1);
+        this.render();
+      }),
+      title,
+      iconButton("chevron-right", "Next month", () => {
+        this.visibleMonth = addMonths(this.visibleMonth, 1);
+        this.render();
+      }),
+      iconButton("chevrons-right", "Next year", () => {
+        this.visibleMonth = addMonths(this.visibleMonth, 12);
+        this.render();
+      })
+    );
+
+    const weekdays = createElement("div", "ot-date-weekdays");
+    const monday = new Date(2024, 0, 1);
+    for (let index = 0; index < 7; index += 1) {
+      const date = new Date(monday.getFullYear(), monday.getMonth(), monday.getDate() + index);
+      weekdays.append(createElement("span", "", new Intl.DateTimeFormat(undefined, { weekday: "short" }).format(date).replace(/\.$/, "")));
+    }
+
+    const grid = createElement("div", "ot-date-grid");
+    const firstDay = new Date(this.visibleMonth.getFullYear(), this.visibleMonth.getMonth(), 1);
+    const mondayOffset = (firstDay.getDay() + 6) % 7;
+    const firstCell = new Date(firstDay.getFullYear(), firstDay.getMonth(), firstDay.getDate() - mondayOffset);
+
+    for (let index = 0; index < 42; index += 1) {
+      const date = new Date(firstCell.getFullYear(), firstCell.getMonth(), firstCell.getDate() + index);
+      const iso = isoFromDate(date);
+      const button = createElement("button", "ot-date-day", String(date.getDate()));
+      button.type = "button";
+      if (date.getMonth() !== this.visibleMonth.getMonth()) button.classList.add("is-outside");
+      if (iso === this.startDate || iso === this.dueDate) button.classList.add("is-selected");
+      if (this.startDate && this.dueDate && iso > this.startDate && iso < this.dueDate) button.classList.add("is-range");
+      button.addEventListener("click", () => this.selectDate(iso));
+      grid.append(button);
+    }
+
+    calendar.append(nav, weekdays, grid);
+    return calendar;
+  }
+
+  renderDateFields() {
+    const fields = createElement("div", "ot-date-fields");
+    fields.append(
+      this.renderDateField("start", "Start date", this.startDate),
+      this.renderDateField("due", "Due date", this.dueDate)
+    );
+    return fields;
+  }
+
+  renderDateField(field, label, value) {
+    const wrap = createElement("div", "ot-date-field");
+    wrap.append(createElement("span", "ot-date-field-label", label));
+
+    const row = createElement("div", "ot-date-field-row");
+    const checkbox = createElement("input", "ot-date-checkbox");
+    checkbox.type = "checkbox";
+    checkbox.checked = !!value;
+    checkbox.addEventListener("change", () => {
+      this.activeField = field;
+      if (!checkbox.checked) this[field === "start" ? "startDate" : "dueDate"] = "";
+      this.render();
+    });
+
+    const dateButton = createElement("button", `ot-date-field-button${value ? "" : " is-empty"}`, fieldDateLabel(value));
+    dateButton.type = "button";
+    if (this.activeField === field) dateButton.classList.add("is-active");
+    dateButton.addEventListener("click", () => {
+      this.activeField = field;
+      this.render();
+    });
+
+    row.append(checkbox, dateButton);
+    wrap.append(row);
+    return wrap;
+  }
+
+  renderActions() {
+    const actions = createElement("div", "ot-modal-actions");
+    const clear = createElement("button", "", "Clear dates");
+    const cancel = createElement("button", "", "Cancel");
+    const save = createElement("button", "mod-cta", "Save");
+
+    [clear, cancel, save].forEach((button) => {
+      button.type = "button";
+    });
+
+    clear.addEventListener("click", async () => {
+      await this.plugin.updateCard(this.card.id, { startDate: "", dueDate: "" });
+      this.close();
+    });
+    cancel.addEventListener("click", () => this.close());
+    save.addEventListener("click", async () => {
+      await this.plugin.updateCard(this.card.id, {
+        startDate: this.startDate,
+        dueDate: this.dueDate,
+      });
+      this.close();
+    });
+
+    actions.append(clear, cancel, save);
+    return actions;
+  }
+
+  selectDate(date) {
+    if (this.activeField === "start") {
+      this.startDate = date;
+      if (this.dueDate && this.dueDate < date) this.dueDate = "";
+    } else {
+      this.dueDate = date;
+      if (this.startDate && this.startDate > date) this.startDate = "";
+    }
+    this.render();
+  }
+}
+
+class AboutModal extends Modal {
+  constructor(app, plugin) {
+    super(app);
+    this.plugin = plugin;
+  }
+
+  onOpen() {
+    this.contentEl.replaceChildren();
+    this.contentEl.addClass("ot-about-modal");
+    this.contentEl.append(
+      createElement("h2", "", "Task Deck"),
+      createElement("p", "", "A Trello-style task board for Obsidian with Markdown-backed cards, labels, dates, and checklists.")
+    );
+
+    const actions = createElement("div", "ot-modal-actions");
+    const openSettings = createElement("button", "", "Open settings");
+    const sync = createElement("button", "", "Sync notes");
+    const close = createElement("button", "mod-cta", "Close");
+    [openSettings, sync, close].forEach((button) => {
+      button.type = "button";
+    });
+    openSettings.addEventListener("click", () => {
+      this.app.setting.open();
+      this.app.setting.openTabById(this.plugin.manifest.id);
+      this.close();
+    });
+    sync.addEventListener("click", async () => {
+      await this.plugin.syncCardsFromFolder();
+      this.plugin.refreshViews();
+      new Notice("Task Deck synced.");
+    });
+    close.addEventListener("click", () => this.close());
+    actions.append(openSettings, sync, close);
+    this.contentEl.append(actions);
+  }
+}
+
+class CardModal extends Modal {
+  constructor(app, plugin, cardId) {
+    super(app);
+    this.plugin = plugin;
+    this.cardId = cardId;
+    this.localLabels = [];
+    this.localGlobalLabels = [];
+    this.localDetails = "";
+    this.localChecklist = [];
+    this.detailsTextarea = null;
+    this.addingChecklistItem = false;
+  }
+
+  onOpen() {
+    this.contentEl.replaceChildren(createElement("div", "ot-loading", "Opening card..."));
+    this.load().catch((error) => {
+      console.error(error);
+      new Notice("Could not open card.");
+      this.close();
+    });
+  }
+
+  async load() {
+    const card = this.plugin.data.cards[this.cardId];
+    if (!card) {
+      new Notice("Card not found.");
+      this.close();
+      return;
+    }
+
+    await this.plugin.hydrateCardFromFile(card);
+    this.card = card;
+    this.localLabels = clone(card.labels || []);
+    this.localGlobalLabels = clone(this.plugin.data.labels || []);
+    this.localLabels.forEach((label) => this.ensureLocalGlobalLabel(label));
+    this.localDetails = card.details || "";
+    this.localChecklist = clone(card.checklist || []);
+    this.render();
+  }
+
+  ensureLocalGlobalLabel(label) {
+    const name = cleanLabelName(label);
+    if (!name) return null;
+
+    const key = labelKey(name);
+    const existing = this.localGlobalLabels.find((item) => labelKey(item) === key);
+    if (existing) return existing;
+
+    const globalLabel = { name, color: label.color || "#d43c35" };
+    this.localGlobalLabels.push(globalLabel);
+    return globalLabel;
+  }
+
+  isSelectedLabel(label) {
+    const key = labelKey(label);
+    return this.localLabels.some((item) => labelKey(item) === key);
+  }
+
+  render() {
+    const card = this.card;
+    this.contentEl.replaceChildren();
+    this.contentEl.addClass("ot-card-modal");
+
+    const title = createElement("input", "ot-title-input");
+    title.type = "text";
+    title.value = card.title;
+    title.placeholder = "Card title";
+
+    const labelsField = this.renderLabelsField();
+    const detailsField = this.renderDetailsField();
+    const checklistField = this.renderChecklistField();
+
+    const actions = createElement("div", "ot-modal-actions");
+    const deleteButton = createElement("button", "mod-warning", "Delete");
+    const openNote = createElement("button", "", "Open note");
+    const cancel = createElement("button", "", "Cancel");
+    const save = createElement("button", "mod-cta", "Save");
+
+    [deleteButton, openNote, cancel, save].forEach((button) => {
+      button.type = "button";
+    });
+
+    deleteButton.addEventListener("click", async () => {
+      if (!window.confirm("Delete this card and its linked Markdown note?")) return;
+      await this.plugin.deleteCard(card.id);
+      this.close();
+    });
+
+    openNote.addEventListener("click", async () => {
+      await this.saveFromForm(title);
+      await this.plugin.openCardFile(card.id);
+      this.close();
+    });
+
+    cancel.addEventListener("click", () => this.close());
+    save.addEventListener("click", async () => {
+      await this.saveFromForm(title);
+      this.close();
+    });
+
+    actions.append(deleteButton, openNote, cancel, save);
+
+    this.contentEl.append(title, labelsField, detailsField, checklistField, actions);
+    requestAnimationFrame(() => title.focus());
+  }
+
+  renderLabelsField() {
+    const field = createElement("div", "ot-field ot-label-editor");
+    field.append(createElement("span", "", "Labels"));
+    const labelsWrap = createElement("div", "ot-selected-labels");
+    const addButton = iconButton("plus", "Choose labels", () => {
+      new LabelPickerModal(this.app, this.localGlobalLabels, this.localLabels, (labels, selectedLabels) => {
+        this.localGlobalLabels = labels;
+        this.localLabels = selectedLabels;
+        renderLabels();
+      }).open();
+    });
+    addButton.classList.add("ot-label-add-button");
+
+    const renderLabels = () => {
+      labelsWrap.replaceChildren();
+
+      this.localLabels.forEach((label, index) => {
+        const pill = createElement("button", "ot-large-label-pill");
+        pill.type = "button";
+        pill.textContent = label.name;
+        pill.style.backgroundColor = label.color;
+        pill.title = "Remove label";
+        pill.addEventListener("click", () => {
+          this.localLabels.splice(index, 1);
+          renderLabels();
+        });
+        labelsWrap.append(pill);
+      });
+
+      labelsWrap.append(addButton);
+    };
+    renderLabels();
+    field.append(labelsWrap);
+    return field;
+  }
+
+  renderDetailsField() {
+    const field = createElement("div", "ot-field");
+    const header = createElement("div", "ot-field-row");
+    header.append(createElement("span", "", "Details"));
+    field.append(header);
+
+    const preview = createElement("div", "ot-markdown-preview");
+    const editor = createElement("textarea", "ot-textarea ot-details-editor is-hidden");
+    editor.placeholder = "Card notes...";
+    editor.value = this.localDetails;
+    this.detailsTextarea = editor;
+
+    const renderPreview = () => {
+      preview.replaceChildren();
+      if (!this.localDetails.trim()) {
+        preview.append(createElement("span", "ot-empty-text", "No details"));
+        return;
+      }
+
+      Promise.resolve(
+        MarkdownRenderer.render(this.app, this.localDetails, preview, this.card.filePath || "", this)
+      ).catch(console.error);
+    };
+
+    const showEditor = () => {
+      editor.value = this.localDetails;
+      preview.classList.add("is-hidden");
+      editor.classList.remove("is-hidden");
+      requestAnimationFrame(() => editor.focus());
+    };
+
+    const showPreview = () => {
+      this.localDetails = editor.value;
+      editor.classList.add("is-hidden");
+      preview.classList.remove("is-hidden");
+      renderPreview();
+    };
+
+    header.append(iconButton("pencil", "Edit details", showEditor));
+    preview.addEventListener("click", showEditor);
+    editor.addEventListener("input", () => {
+      this.localDetails = editor.value;
+    });
+    editor.addEventListener("blur", showPreview);
+
+    renderPreview();
+    field.append(preview, editor);
+    return field;
+  }
+
+  renderChecklistField() {
+    const field = createElement("div", "ot-field");
+    const header = createElement("div", "ot-checklist-header");
+    const heading = createElement("div", "ot-checklist-heading");
+    const headingIcon = createElement("span", "ot-checklist-heading-icon");
+    try {
+      setIcon(headingIcon, "check-square");
+    } catch (error) {
+      headingIcon.textContent = "☑";
+    }
+    heading.append(headingIcon, createElement("span", "", "Checklist"));
+    header.append(heading);
+
+    const progress = createElement("div", "ot-checklist-progress");
+    const progressText = createElement("span", "ot-checklist-percent", "0%");
+    const progressTrack = createElement("div", "ot-progress-track");
+    const progressFill = createElement("div", "ot-progress-fill");
+    progressTrack.append(progressFill);
+    progress.append(progressText, progressTrack);
+
+    const list = createElement("div", "ot-checklist");
+    const updateProgress = () => {
+      const stats = checklistStats(this.localChecklist);
+      progressText.textContent = `${stats.percent}%`;
+      progressFill.style.width = `${stats.percent}%`;
+    };
+
+    const renderChecklist = () => {
+      list.replaceChildren();
+      if (!this.localChecklist.length) {
+        list.append(createElement("span", "ot-empty-text", "No checklist items"));
+      }
+
+      this.localChecklist.forEach((item, index) => {
+        const row = createElement("div", "ot-checklist-row");
+        const checkbox = createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.checked = !!item.done;
+        const input = createElement("input", "ot-checklist-title");
+        input.type = "text";
+        input.value = item.text || "";
+        const remove = iconButton("x", "Remove item", () => {
+          this.localChecklist.splice(index, 1);
+          renderChecklist();
+        });
+        remove.addEventListener("click", (event) => event.stopPropagation());
+
+        checkbox.addEventListener("change", () => {
+          item.done = checkbox.checked;
+          updateProgress();
+        });
+        input.addEventListener("input", () => {
+          item.text = input.value;
+        });
+        row.append(checkbox, input, remove);
+        list.append(row);
+      });
+      updateProgress();
+    };
+
+    const addArea = createElement("div", "ot-checklist-add");
+    const renderAddArea = () => {
+      addArea.replaceChildren();
+
+      if (!this.addingChecklistItem) {
+        addArea.append(textButton("plus", "Add item", () => {
+          this.addingChecklistItem = true;
+          renderAddArea();
+        }));
+        return;
+      }
+
+      const addForm = createElement("form", "ot-checklist-add-form");
+      const addInput = createElement("input", "ot-input");
+      addInput.type = "text";
+      addInput.placeholder = "Checklist item";
+      const addButton = createElement("button", "mod-cta", "Add");
+      const cancel = iconButton("x", "Cancel", () => {
+        this.addingChecklistItem = false;
+        renderAddArea();
+      });
+      addButton.type = "submit";
+      addForm.append(addInput, addButton, cancel);
+      addForm.addEventListener("submit", (event) => {
+        event.preventDefault();
+        const text = textLine(addInput.value);
+        if (!text) {
+          addInput.focus();
+          return;
+        }
+        this.localChecklist.push({ done: false, text });
+        this.addingChecklistItem = false;
+        renderChecklist();
+        renderAddArea();
+      });
+      addInput.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") {
+          this.addingChecklistItem = false;
+          renderAddArea();
+        }
+      });
+      addArea.append(addForm);
+      requestAnimationFrame(() => addInput.focus());
+    };
+
+    renderChecklist();
+    renderAddArea();
+    field.append(header, progress, list, addArea);
+    return field;
+  }
+
+  async saveFromForm(titleInput) {
+    if (this.detailsTextarea) this.localDetails = this.detailsTextarea.value;
+
+    await this.plugin.updateCard(this.card.id, {
+      title: textLine(titleInput.value) || this.card.title,
+      labels: clone(this.localLabels),
+      details: this.localDetails.trim(),
+      checklist: this.localChecklist
+        .map((item) => ({ done: !!item.done, text: textLine(item.text) }))
+        .filter((item) => item.text),
+    }, clone(this.localGlobalLabels));
+  }
+}
+
+class BoardView extends ItemView {
+  constructor(leaf, plugin) {
+    super(leaf);
+    this.plugin = plugin;
+    this.addingCardListId = null;
+    this.editingCardId = null;
+  }
+
+  getViewType() {
+    return VIEW_TYPE;
+  }
+
+  getDisplayText() {
+    return "Task Deck";
+  }
+
+  getIcon() {
+    return "layout-dashboard";
+  }
+
+  async onOpen() {
+    this.render();
+  }
+
+  render() {
+    const board = this.plugin.getBoard();
+    this.contentEl.replaceChildren();
+    this.contentEl.addClass("ot-board-root");
+
+    const toolbar = createElement("div", "ot-toolbar");
+    toolbar.append(createElement("h2", "", board.name));
+    const actions = createElement("div", "ot-toolbar-actions");
+    actions.append(
+      textButton("info", "About", () => new AboutModal(this.app, this.plugin).open()),
+      textButton("heart", "Support", () => window.open(DONATION_URL, "_blank")),
+      textButton("plus", "Add list", () => this.plugin.addList())
+    );
+    toolbar.append(actions);
+
+    const scroller = createElement("div", "ot-board-scroll");
+    board.lists.forEach((list) => scroller.append(this.renderList(list)));
+
+    this.contentEl.append(toolbar, scroller);
+  }
+
+  renderList(list) {
+    const column = createElement("section", "ot-list");
+    column.dataset.listId = list.id;
+    const clearListDropState = () => {
+      column.classList.remove("is-list-drop-before", "is-list-drop-after");
+    };
+
+    const header = createElement("div", "ot-list-header");
+    header.draggable = true;
+    header.classList.add("ot-list-drag-source");
+    header.addEventListener("dragstart", (event) => {
+      event.dataTransfer.setData(LIST_DRAG_TYPE, list.id);
+      event.dataTransfer.effectAllowed = "move";
+      column.classList.add("is-dragging-list");
+    });
+    header.addEventListener("dragend", () => {
+      column.classList.remove("is-dragging-list");
+      clearListDropState();
+    });
+
+    const dragHandle = createElement("span", "ot-list-drag-handle");
+    try {
+      setIcon(dragHandle, "grip-vertical");
+    } catch (error) {
+      dragHandle.textContent = "";
+    }
+
+    header.append(dragHandle, createElement("h3", "", list.title));
+    header.append(createElement("span", "ot-list-count", String(list.cardIds.length)));
+    header.append(iconButton("ellipsis", "List menu", (event) => this.showListMenu(event, list)));
+
+    column.addEventListener("dragover", (event) => {
+      if (!hasDragType(event, LIST_DRAG_TYPE)) return;
+      event.preventDefault();
+      const rect = column.getBoundingClientRect();
+      const after = event.clientX > rect.left + rect.width / 2;
+      column.classList.toggle("is-list-drop-before", !after);
+      column.classList.toggle("is-list-drop-after", after);
+    });
+    column.addEventListener("dragleave", (event) => {
+      if (!column.contains(event.relatedTarget)) clearListDropState();
+    });
+    column.addEventListener("drop", async (event) => {
+      if (!hasDragType(event, LIST_DRAG_TYPE)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const rect = column.getBoundingClientRect();
+      const after = event.clientX > rect.left + rect.width / 2;
+      const draggedListId = event.dataTransfer.getData(LIST_DRAG_TYPE);
+      clearListDropState();
+      await this.plugin.moveList(draggedListId, list.id, after);
+    });
+
+    const cards = createElement("div", "ot-cards");
+    cards.addEventListener("dragover", (event) => {
+      if (hasDragType(event, LIST_DRAG_TYPE)) return;
+      event.preventDefault();
+      cards.classList.add("is-drop-zone");
+    });
+    cards.addEventListener("dragleave", () => cards.classList.remove("is-drop-zone"));
+    cards.addEventListener("drop", async (event) => {
+      if (hasDragType(event, LIST_DRAG_TYPE)) return;
+      event.preventDefault();
+      cards.classList.remove("is-drop-zone");
+      const cardId = event.dataTransfer.getData("text/plain");
+      await this.plugin.moveCard(cardId, list.id);
+    });
+
+    if (this.addingCardListId === list.id) {
+      cards.append(this.renderCardComposer(list));
+    }
+
+    list.cardIds.forEach((cardId) => {
+      const card = this.plugin.data.cards[cardId];
+      if (card) cards.append(this.renderCard(card, list.id));
+    });
+
+    const footer = createElement("div", "ot-list-footer");
+    if (this.addingCardListId !== list.id) {
+      footer.append(textButton("plus", "Add card", () => this.showCardComposer(list.id)));
+    }
+
+    column.append(header, cards);
+    if (footer.childElementCount) column.append(footer);
+    return column;
+  }
+
+  showCardComposer(listId) {
+    this.addingCardListId = listId;
+    this.render();
+  }
+
+  hideCardComposer() {
+    this.addingCardListId = null;
+    this.render();
+  }
+
+  renderCardComposer(list) {
+    const form = createElement("form", "ot-card-composer");
+    const input = createElement("input", "ot-inline-card-input");
+    input.type = "text";
+    input.placeholder = "Card title";
+
+    const actions = createElement("div", "ot-card-composer-actions");
+    const add = createElement("button", "mod-cta", "Add");
+    const cancel = iconButton("x", "Cancel", () => this.hideCardComposer());
+    add.type = "submit";
+    actions.append(add, cancel);
+
+    form.append(input, actions);
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const title = textLine(input.value);
+      if (!title) {
+        input.focus();
+        return;
+      }
+
+      this.addingCardListId = null;
+      await this.plugin.createCard(list.id, title);
+    });
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") this.hideCardComposer();
+    });
+
+    requestAnimationFrame(() => input.focus());
+    return form;
+  }
+
+  renderCard(card, listId) {
+    const element = createElement("article", "ot-card");
+    const isRenaming = this.editingCardId === card.id;
+    element.draggable = !isRenaming;
+    element.dataset.cardId = card.id;
+    if (card.completed) element.classList.add("is-completed");
+
+    element.addEventListener("dragstart", (event) => {
+      event.dataTransfer.setData("text/plain", card.id);
+      event.dataTransfer.effectAllowed = "move";
+      element.classList.add("is-dragging");
+    });
+    element.addEventListener("dragend", () => element.classList.remove("is-dragging"));
+    element.addEventListener("dragover", (event) => {
+      event.preventDefault();
+      element.classList.add("is-drop-target");
+    });
+    element.addEventListener("dragleave", () => element.classList.remove("is-drop-target"));
+    element.addEventListener("drop", async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      element.classList.remove("is-drop-target");
+      const draggedId = event.dataTransfer.getData("text/plain");
+      await this.plugin.moveCard(draggedId, listId, card.id);
+    });
+    element.addEventListener("click", () => new CardModal(this.app, this.plugin, card.id).open());
+
+    const labels = createElement("div", "ot-card-labels");
+    (card.labels || []).forEach((label) => {
+      const pill = createElement("span", "ot-card-label", label.name);
+      pill.style.backgroundColor = label.color;
+      pill.title = label.name;
+      labels.append(pill);
+    });
+
+    const completeButton = iconButton(card.completed ? "check" : "circle", card.completed ? "Mark as incomplete" : "Mark as complete", async (event) => {
+      event.stopPropagation();
+      await this.plugin.toggleCardCompleted(card.id);
+    });
+    completeButton.classList.add("ot-card-complete-toggle");
+    completeButton.draggable = false;
+    completeButton.replaceChildren();
+    if (card.completed) completeButton.append(createElement("span", "ot-card-complete-mark", "✓"));
+
+    const title = isRenaming ? this.renderCardTitleEditor(card) : createElement("div", "ot-card-title", card.title);
+    const editButton = iconButton("pencil", "Edit card", (event) => {
+      event.stopPropagation();
+      this.editingCardId = card.id;
+      this.showCardMenu(event, card);
+      this.render();
+    });
+    editButton.classList.add("ot-card-action-button");
+    editButton.draggable = false;
+    const actions = createElement("div", "ot-card-actions");
+    actions.append(editButton);
+
+    const main = createElement("div", "ot-card-main");
+    main.append(completeButton, title, actions);
+    if (labels.childElementCount) element.append(labels);
+    element.append(main);
+
+    const meta = this.renderCardMeta(card);
+    if (meta.childElementCount) element.append(meta);
+
+    return element;
+  }
+
+  renderCardTitleEditor(card) {
+    const form = createElement("form", "ot-card-title-form");
+    const input = createElement("input", "ot-card-title-input");
+    let finished = false;
+    input.type = "text";
+    input.value = card.title;
+    input.placeholder = "Card title";
+
+    const finish = async (save) => {
+      if (finished) return;
+      finished = true;
+      const title = textLine(input.value);
+      this.editingCardId = null;
+      if (save && title && title !== card.title) {
+        await this.plugin.updateCard(card.id, { title });
+      } else {
+        this.render();
+      }
+    };
+
+    form.addEventListener("click", (event) => event.stopPropagation());
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      finish(true).catch(console.error);
+    });
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        finish(false).catch(console.error);
+      }
+    });
+    input.addEventListener("blur", () => finish(true).catch(console.error));
+
+    form.append(input);
+    requestAnimationFrame(() => {
+      input.focus();
+      input.select();
+    });
+    return form;
+  }
+
+  renderCardMeta(card) {
+    const meta = createElement("div", "ot-card-meta");
+    const dates = dateRangeLabel(card.startDate, card.dueDate);
+
+    if (dates) {
+      const badge = createElement("span", "ot-card-meta-item ot-card-date-badge");
+      const icon = createElement("span", "ot-card-date-icon");
+      try {
+        setIcon(icon, "clock");
+      } catch (error) {
+        icon.textContent = "";
+      }
+      badge.append(icon, createElement("span", "", dates));
+      meta.append(badge);
+    }
+
+    if ((card.checklist || []).length) {
+      const stats = checklistStats(card.checklist);
+      const badge = createElement("span", "ot-card-meta-item ot-card-checklist-badge");
+      const icon = createElement("span", "ot-card-checklist-icon");
+      try {
+        setIcon(icon, "check-square");
+      } catch (error) {
+        icon.textContent = "☑";
+      }
+      badge.append(icon, createElement("span", "", `${stats.done}/${stats.total}`));
+      meta.append(badge);
+    }
+
+    if (card.details) {
+      meta.append(createElement("span", "ot-card-meta-item", "☰"));
+    }
+
+    return meta;
+  }
+
+  showCardMenu(event, card) {
+    event.stopPropagation();
+    const menu = new Menu();
+    menu.addItem((item) => {
+      item
+        .setTitle("Edit dates")
+        .setIcon("calendar-days")
+        .onClick(() => new CardDatesModal(this.app, this.plugin, card.id).open());
+    });
+    menu.addItem((item) => {
+      item
+        .setTitle("Delete card")
+        .setIcon("trash")
+        .onClick(async () => {
+          if (!window.confirm("Delete this card and its linked Markdown note?")) return;
+          await this.plugin.deleteCard(card.id);
+        });
+    });
+    menu.showAtMouseEvent(event);
+  }
+
+  showListMenu(event, list) {
+    const menu = new Menu();
+    menu.addItem((item) => {
+      item
+        .setTitle("Rename list")
+        .setIcon("pencil")
+        .onClick(() => this.plugin.renameList(list.id));
+    });
+    menu.addItem((item) => {
+      item
+        .setTitle("Delete list")
+        .setIcon("trash")
+        .onClick(() => this.plugin.deleteList(list.id));
+    });
+    menu.showAtMouseEvent(event);
+  }
+}
+
+class TaskDeckSettingTab extends PluginSettingTab {
+  constructor(app, plugin) {
+    super(app, plugin);
+    this.plugin = plugin;
+  }
+
+  display() {
+    const { containerEl } = this;
+    containerEl.empty();
+    containerEl.addClass("ot-settings");
+
+    containerEl.createEl("h2", { text: "Task Deck" });
+    containerEl.createEl("p", {
+      text: "A Trello-style task board for Obsidian with Markdown-backed cards, global labels, dates, and checklists.",
+    });
+
+    new Setting(containerEl)
+      .setName("Card folder")
+      .setDesc(`Cards are stored as Markdown notes in ${CARD_FOLDER}/.`);
+
+    new Setting(containerEl)
+      .setName("Open board")
+      .setDesc("Open the Task Deck board view.")
+      .addButton((button) => {
+        button
+          .setButtonText("Open")
+          .setCta()
+          .onClick(() => this.plugin.activateView());
+      });
+
+    new Setting(containerEl)
+      .setName("Sync card notes")
+      .setDesc("Import Markdown cards created manually or by AI inside the card folder.")
+      .addButton((button) => {
+        button
+          .setButtonText("Sync now")
+          .onClick(async () => {
+            await this.plugin.syncCardsFromFolder();
+            this.plugin.refreshViews();
+            new Notice("Task Deck synced.");
+          });
+      });
+
+    new Setting(containerEl)
+      .setName("Support development")
+      .setDesc("Open the donation page.")
+      .addButton((button) => {
+        button
+          .setButtonText("Donate")
+          .onClick(() => window.open(DONATION_URL, "_blank"));
+      });
+
+    new Setting(containerEl)
+      .setName("Version")
+      .setDesc(this.plugin.manifest.version || "0.1.0");
+  }
+}
+
+module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
+  async onload() {
+    await this.loadPluginData();
+
+    this.registerView(VIEW_TYPE, (leaf) => new BoardView(leaf, this));
+    this.addSettingTab(new TaskDeckSettingTab(this.app, this));
+    ["create", "modify", "rename"].forEach((eventName) => {
+      this.registerEvent(this.app.vault.on(eventName, (file) => this.queueCardFolderSync(file)));
+    });
+
+    this.addRibbonIcon("layout-dashboard", "Open Task Deck", () => this.activateView());
+    this.addCommand({
+      id: "open-kanban-board",
+      name: "Open Task Deck",
+      callback: () => this.activateView(),
+    });
+    this.addCommand({
+      id: "quick-add-kanban-card",
+      name: "Add card to first list",
+      callback: async () => {
+        const firstList = this.getBoard().lists[0];
+        if (firstList) {
+          await this.addCard(firstList.id);
+        } else {
+          new Notice("Add a list first.");
+        }
+      },
+    });
+  }
+
+  async onunload() {
+    this.app.workspace.detachLeavesOfType(VIEW_TYPE);
+  }
+
+  async loadPluginData() {
+    const saved = await this.loadData();
+    this.data = Object.assign(clone(DEFAULT_DATA), saved || {});
+    this.data.boards = this.data.boards && this.data.boards.length ? this.data.boards : clone(DEFAULT_DATA.boards);
+    this.data.cards = this.data.cards || {};
+    this.data.labels = this.data.labels || [];
+    this.data.activeBoardId = this.data.activeBoardId || this.data.boards[0].id;
+    Object.values(this.data.cards).forEach((card) => {
+      card.labels = this.normalizeCardLabels(card.labels || []);
+      card.completed = !!card.completed;
+      card.startDate = cleanDate(card.startDate);
+      card.dueDate = cleanDate(card.dueDate);
+    });
+    await this.syncCardsFromFolder();
+  }
+
+  async savePluginData() {
+    await this.saveData(this.data);
+  }
+
+  getBoard() {
+    return this.data.boards.find((board) => board.id === this.data.activeBoardId) || this.data.boards[0];
+  }
+
+  normalizeGlobalLabels(labels) {
+    const seen = new Set();
+    return (labels || [])
+      .map((label) => ({
+        name: cleanLabelName(label),
+        color: label && label.color ? label.color : "#d43c35",
+      }))
+      .filter((label) => label.name)
+      .filter((label) => {
+        const key = labelKey(label);
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+  }
+
+  ensureGlobalLabel(label) {
+    this.data.labels = this.normalizeGlobalLabels(this.data.labels);
+
+    const cleanLabel = {
+      name: cleanLabelName(label),
+      color: label && label.color ? label.color : "#d43c35",
+    };
+    if (!cleanLabel.name) return null;
+
+    const existing = this.data.labels.find((item) => labelKey(item) === labelKey(cleanLabel));
+    if (existing) return existing;
+
+    this.data.labels.push(cleanLabel);
+    return cleanLabel;
+  }
+
+  normalizeCardLabels(labels) {
+    const seen = new Set();
+    return (labels || [])
+      .map((label) => this.ensureGlobalLabel(label))
+      .filter(Boolean)
+      .filter((label) => {
+        const key = labelKey(label);
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+  }
+
+  findList(listId) {
+    return this.getBoard().lists.find((list) => list.id === listId);
+  }
+
+  findListByCard(cardId) {
+    return this.getBoard().lists.find((list) => list.cardIds.includes(cardId));
+  }
+
+  refreshViews() {
+    this.app.workspace.getLeavesOfType(VIEW_TYPE).forEach((leaf) => {
+      if (leaf.view && leaf.view.render) leaf.view.render();
+    });
+  }
+
+  isCardFile(file) {
+    return file && file.path && file.path.startsWith(`${CARD_FOLDER}/`) && file.extension === "md";
+  }
+
+  queueCardFolderSync(file) {
+    if (!this.isCardFile(file)) return;
+
+    window.clearTimeout(this.cardFolderSyncTimer);
+    this.cardFolderSyncTimer = window.setTimeout(async () => {
+      await this.syncCardsFromFolder();
+      this.refreshViews();
+    }, 250);
+  }
+
+  async syncCardsFromFolder() {
+    const board = this.getBoard();
+    if (!board.lists.length) board.lists.push({ id: uid("list"), title: "TODO", cardIds: [] });
+
+    const files = this.app.vault.getMarkdownFiles().filter((file) => file.path.startsWith(`${CARD_FOLDER}/`));
+    let changed = false;
+    for (const file of files) {
+      const markdown = await this.app.vault.read(file);
+      const parsed = parseCardMarkdown(markdown);
+      const existingByPath = Object.values(this.data.cards).find((card) => card.filePath === file.path);
+      const cardId = parsed.id || (existingByPath && existingByPath.id) || uid("card");
+      const existing = this.data.cards[cardId] || existingByPath;
+      const targetList = this.findList(parsed.listId) || this.findList(existing && existing.listId) || board.lists[0];
+      const now = new Date().toISOString();
+      const card = existing || { id: cardId, createdAt: now };
+
+      Object.assign(card, {
+        id: card.id || cardId,
+        title: parsed.title || file.basename,
+        listId: targetList.id,
+        labels: parsed.labels.length ? this.normalizeCardLabels(parsed.labels) : this.normalizeCardLabels(card.labels || []),
+        details: parsed.details,
+        checklist: parsed.checklist,
+        completed: parsed.completed !== null ? parsed.completed : !!card.completed,
+        startDate: parsed.startDate !== null ? parsed.startDate : cleanDate(card.startDate),
+        dueDate: parsed.dueDate !== null ? parsed.dueDate : cleanDate(card.dueDate),
+        filePath: file.path,
+        updatedAt: card.updatedAt || now,
+      });
+
+      if (!this.data.cards[card.id]) {
+        this.data.cards[card.id] = card;
+        changed = true;
+      }
+
+      const currentList = this.findListByCard(card.id);
+      if (currentList && currentList.id !== targetList.id) {
+        currentList.cardIds = currentList.cardIds.filter((id) => id !== card.id);
+      }
+      if (!targetList.cardIds.includes(card.id)) {
+        targetList.cardIds.push(card.id);
+        changed = true;
+      }
+    }
+
+    if (changed) await this.savePluginData();
+  }
+
+  promptText(title, placeholder, initialValue, onSubmit) {
+    new TextPromptModal(this.app, title, placeholder, initialValue, onSubmit).open();
+  }
+
+  async activateView() {
+    const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE);
+    const leaf = leaves[0] || this.app.workspace.getLeaf(true);
+    await leaf.setViewState({ type: VIEW_TYPE, active: true });
+    this.app.workspace.revealLeaf(leaf);
+  }
+
+  addList() {
+    this.promptText("Add list", "List name", "", async (title) => {
+      this.getBoard().lists.push({ id: uid("list"), title, cardIds: [] });
+      await this.savePluginData();
+      this.refreshViews();
+    });
+  }
+
+  renameList(listId) {
+    const list = this.findList(listId);
+    if (!list) return;
+
+    this.promptText("Rename list", "List name", list.title, async (title) => {
+      list.title = title;
+      await this.savePluginData();
+      this.refreshViews();
+    });
+  }
+
+  async deleteList(listId) {
+    const board = this.getBoard();
+    const list = this.findList(listId);
+    if (!list) return;
+
+    const message = list.cardIds.length
+      ? `Delete "${list.title}" and its ${list.cardIds.length} cards?`
+      : `Delete "${list.title}"?`;
+    if (!window.confirm(message)) return;
+
+    for (const cardId of list.cardIds) {
+      await this.deleteCard(cardId, false);
+    }
+    board.lists = board.lists.filter((item) => item.id !== listId);
+    await this.savePluginData();
+    this.refreshViews();
+  }
+
+  async addCard(listId) {
+    let leaf = this.app.workspace.getLeavesOfType(VIEW_TYPE)[0];
+    if (!leaf) {
+      await this.activateView();
+      leaf = this.app.workspace.getLeavesOfType(VIEW_TYPE)[0];
+    }
+
+    if (leaf && leaf.view && leaf.view.showCardComposer) {
+      leaf.view.showCardComposer(listId);
+    }
+  }
+
+  async createCard(listId, title) {
+    const list = this.findList(listId);
+    if (!list) return;
+
+    const now = new Date().toISOString();
+    const card = {
+      id: uid("card"),
+      title,
+      listId,
+      labels: [],
+      details: "",
+      checklist: [],
+      completed: false,
+      startDate: "",
+      dueDate: "",
+      filePath: await this.nextCardPath(title),
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    this.data.cards[card.id] = card;
+    list.cardIds.unshift(card.id);
+    await this.writeCardFile(card);
+    await this.savePluginData();
+    this.refreshViews();
+  }
+
+  async updateCard(cardId, patch, globalLabels) {
+    const card = this.data.cards[cardId];
+    if (!card) return;
+
+    if (globalLabels) this.data.labels = this.normalizeGlobalLabels(globalLabels);
+    if (patch.labels) patch.labels = this.normalizeCardLabels(patch.labels);
+    if (Object.prototype.hasOwnProperty.call(patch, "completed")) patch.completed = !!patch.completed;
+    if (Object.prototype.hasOwnProperty.call(patch, "startDate")) patch.startDate = cleanDate(patch.startDate);
+    if (Object.prototype.hasOwnProperty.call(patch, "dueDate")) patch.dueDate = cleanDate(patch.dueDate);
+    if (patch.title && textLine(patch.title) !== textLine(card.title)) {
+      await this.renameCardFile(card, patch.title);
+    }
+    Object.assign(card, patch, { updatedAt: new Date().toISOString() });
+    await this.writeCardFile(card);
+    await this.savePluginData();
+    this.refreshViews();
+  }
+
+  async moveCard(cardId, targetListId, beforeCardId) {
+    if (!cardId || cardId === beforeCardId) return;
+    const targetList = this.findList(targetListId);
+    const card = this.data.cards[cardId];
+    if (!targetList || !card) return;
+
+    this.getBoard().lists.forEach((list) => {
+      list.cardIds = list.cardIds.filter((id) => id !== cardId);
+    });
+
+    const beforeIndex = beforeCardId ? targetList.cardIds.indexOf(beforeCardId) : -1;
+    if (beforeIndex === -1) {
+      targetList.cardIds.push(cardId);
+    } else {
+      targetList.cardIds.splice(beforeIndex, 0, cardId);
+    }
+
+    card.listId = targetListId;
+    await this.writeCardFile(card);
+    await this.savePluginData();
+    this.refreshViews();
+  }
+
+  async moveList(listId, targetListId, afterTarget = false) {
+    if (!listId || listId === targetListId) return;
+
+    const board = this.getBoard();
+    const fromIndex = board.lists.findIndex((list) => list.id === listId);
+    if (fromIndex === -1) return;
+
+    const [list] = board.lists.splice(fromIndex, 1);
+    const targetIndex = board.lists.findIndex((item) => item.id === targetListId);
+    if (targetIndex === -1) {
+      board.lists.push(list);
+    } else {
+      board.lists.splice(targetIndex + (afterTarget ? 1 : 0), 0, list);
+    }
+
+    await this.savePluginData();
+    this.refreshViews();
+  }
+
+  async toggleCardCompleted(cardId) {
+    const card = this.data.cards[cardId];
+    if (!card) return;
+    await this.updateCard(cardId, { completed: !card.completed });
+  }
+
+  async deleteCard(cardId, saveAndRefresh = true) {
+    const card = this.data.cards[cardId];
+    if (!card) return;
+
+    this.getBoard().lists.forEach((list) => {
+      list.cardIds = list.cardIds.filter((id) => id !== cardId);
+    });
+
+    const file = this.app.vault.getAbstractFileByPath(card.filePath);
+    if (file) await this.app.vault.trash(file, true);
+    delete this.data.cards[cardId];
+
+    if (saveAndRefresh) {
+      await this.savePluginData();
+      this.refreshViews();
+    }
+  }
+
+  async hydrateCardFromFile(card) {
+    const file = this.app.vault.getAbstractFileByPath(card.filePath);
+    if (!file || file.extension !== "md") return;
+
+    const markdown = await this.app.vault.read(file);
+    const parsed = parseCardMarkdown(markdown);
+    card.title = parsed.title || card.title;
+    card.labels = parsed.labels.length ? this.normalizeCardLabels(parsed.labels) : this.normalizeCardLabels(card.labels || []);
+    if (parsed.completed !== null) card.completed = parsed.completed;
+    if (parsed.startDate !== null) card.startDate = parsed.startDate;
+    if (parsed.dueDate !== null) card.dueDate = parsed.dueDate;
+    card.details = parsed.details;
+    card.checklist = parsed.checklist;
+  }
+
+  async openCardFile(cardId) {
+    const card = this.data.cards[cardId];
+    if (!card) return;
+
+    await this.writeCardFile(card);
+    const file = this.app.vault.getAbstractFileByPath(card.filePath);
+    if (!file) return;
+
+    await this.app.workspace.getLeaf(false).openFile(file);
+  }
+
+  async ensureCardFolder() {
+    if (!this.app.vault.getAbstractFileByPath(CARD_FOLDER)) {
+      await this.app.vault.createFolder(CARD_FOLDER);
+    }
+  }
+
+  async nextCardPath(title, currentPath) {
+    await this.ensureCardFolder();
+
+    const base = slugify(title);
+    let path = `${CARD_FOLDER}/${base}.md`;
+    let index = 2;
+    while (path !== currentPath && this.app.vault.getAbstractFileByPath(path)) {
+      path = `${CARD_FOLDER}/${base}-${index}.md`;
+      index += 1;
+    }
+    return path;
+  }
+
+  async renameCardFile(card, title) {
+    const nextPath = await this.nextCardPath(title, card.filePath);
+    if (nextPath === card.filePath) return;
+
+    const file = this.app.vault.getAbstractFileByPath(card.filePath);
+    if (file && file.extension === "md") {
+      await this.app.vault.rename(file, nextPath);
+    }
+    card.filePath = nextPath;
+  }
+
+  async writeCardFile(card) {
+    await this.ensureCardFolder();
+
+    const markdown = [
+      "---",
+      `kanban-card-id: ${card.id}`,
+      `kanban-board-id: ${this.getBoard().id}`,
+      `kanban-list-id: ${card.listId || ""}`,
+      `labels: ${labelsToFrontmatter(card.labels)}`,
+      `completed: ${card.completed ? "true" : "false"}`,
+      `start: ${cleanDate(card.startDate)}`,
+      `due: ${cleanDate(card.dueDate)}`,
+      "---",
+      "",
+      `# ${textLine(card.title)}`,
+      "",
+      "## Details",
+      card.details || "",
+      "",
+      "## Checklist",
+      checklistToMarkdown(card.checklist),
+      "",
+    ].join("\n");
+
+    const file = this.app.vault.getAbstractFileByPath(card.filePath);
+    if (file && file.extension === "md") {
+      await this.app.vault.modify(file, markdown);
+    } else {
+      await this.app.vault.create(card.filePath, markdown);
+    }
+  }
+};
