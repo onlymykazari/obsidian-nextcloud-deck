@@ -6,6 +6,12 @@ I built it for tracking tasks without leaving Obsidian: lists, cards, labels, da
 
 Screenshots will be added later.
 
+## Support
+
+If Task Deck is useful for your workflow, you can support the project here:
+
+https://buymeacoffee.com/carbon06
+
 ## Features
 
 - Kanban lists with drag-and-drop ordering
@@ -27,12 +33,6 @@ Screenshots will be added later.
 - Drag cards between lists and drag list headers to reorder columns.
 
 If you create a Markdown card directly inside `Kanban Cards/`, Task Deck will pick it up and show it on the board.
-
-## Support
-
-If Task Deck is useful for your workflow, you can support the project here:
-
-https://buymeacoffee.com/carbon06
 
 ## Install
 
