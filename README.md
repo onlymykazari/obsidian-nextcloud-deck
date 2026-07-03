@@ -34,6 +34,16 @@ https://buymeacoffee.com/carbon06
 
 If you create a Markdown card directly inside `Kanban Cards/`, Task Deck will pick it up and show it on the board.
 
+## Development
+
+Source files live in `src/`. After changing them, run:
+
+```bash
+node build.js
+```
+
+Obsidian loads the generated `main.js` file.
+
 ## Install
 
 Download the release files and place them here:

@@ -1,0 +1,824 @@
+const { MarkdownRenderer, Modal, Notice, setIcon } = require("obsidian");
+
+const {
+  DEFAULT_LABEL_COLOR,
+  LABEL_COLORS,
+  addMonths,
+  checklistStats,
+  cleanDate,
+  cleanLabelName,
+  clone,
+  createElement,
+  dateFromISO,
+  fieldDateLabel,
+  iconButton,
+  isoFromDate,
+  labelKey,
+  textButton,
+  textLine,
+} = require("./helpers");
+
+class TextPromptModal extends Modal {
+  constructor(app, title, placeholder, initialValue, onSubmit) {
+    super(app);
+    this.title = title;
+    this.placeholder = placeholder;
+    this.initialValue = initialValue || "";
+    this.onSubmit = onSubmit;
+  }
+
+  onOpen() {
+    this.contentEl.replaceChildren();
+    this.contentEl.addClass("ot-prompt-modal");
+
+    this.contentEl.append(createElement("h2", "", this.title));
+
+    const input = createElement("input", "ot-input");
+    input.type = "text";
+    input.placeholder = this.placeholder;
+    input.value = this.initialValue;
+    this.contentEl.append(input);
+
+    const actions = createElement("div", "ot-modal-actions");
+    const cancel = createElement("button", "", "Cancel");
+    const save = createElement("button", "mod-cta", "Save");
+    cancel.type = "button";
+    save.type = "button";
+
+    cancel.addEventListener("click", () => this.close());
+    save.addEventListener("click", () => this.submit(input.value));
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") this.submit(input.value);
+    });
+
+    actions.append(cancel, save);
+    this.contentEl.append(actions);
+
+    requestAnimationFrame(() => input.focus());
+  }
+
+  submit(value) {
+    const cleanValue = textLine(value);
+    if (!cleanValue) {
+      new Notice("Name cannot be empty.");
+      return;
+    }
+
+    this.onSubmit(cleanValue);
+    this.close();
+  }
+}
+
+class LabelPickerModal extends Modal {
+  constructor(app, labels, selectedLabels, onChange) {
+    super(app);
+    this.labels = clone(labels || []);
+    this.selectedLabels = clone(selectedLabels || []);
+    this.onChange = onChange;
+    this.creating = false;
+    this.editingKey = null;
+    this.query = "";
+    this.createName = "";
+    this.createColor = DEFAULT_LABEL_COLOR;
+  }
+
+  onOpen() {
+    this.render();
+  }
+
+  isSelected(label) {
+    const key = labelKey(label);
+    return this.selectedLabels.some((item) => labelKey(item) === key);
+  }
+
+  emitChange() {
+    this.onChange(clone(this.labels), clone(this.selectedLabels));
+  }
+
+  dedupeLabels(labels) {
+    const seen = new Set();
+    return (labels || []).filter((label) => {
+      const key = labelKey(label);
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
+
+  toggleLabel(label) {
+    if (this.isSelected(label)) {
+      this.selectedLabels = this.selectedLabels.filter((item) => labelKey(item) !== labelKey(label));
+    } else {
+      this.selectedLabels.push(clone(label));
+    }
+    this.emitChange();
+    this.render();
+  }
+
+  createLabel(name, color) {
+    const cleanName = textLine(name);
+    if (!cleanName) return;
+
+    const label = { name: cleanName, color: color || DEFAULT_LABEL_COLOR };
+    if (this.editingKey) {
+      const oldKey = this.editingKey;
+      const update = (item) => (labelKey(item) === oldKey ? clone(label) : item);
+      this.labels = this.dedupeLabels(this.labels.map(update));
+      this.selectedLabels = this.dedupeLabels(this.selectedLabels.map(update));
+    } else {
+      const existing = this.labels.find((item) => labelKey(item) === labelKey(cleanName));
+      const nextLabel = existing || label;
+      if (!existing) this.labels.push(nextLabel);
+      if (!this.isSelected(nextLabel)) this.selectedLabels.push(clone(nextLabel));
+    }
+
+    this.creating = false;
+    this.editingKey = null;
+    this.query = "";
+    this.createName = "";
+    this.createColor = DEFAULT_LABEL_COLOR;
+    this.emitChange();
+    this.render();
+  }
+
+  editLabel(label) {
+    this.creating = true;
+    this.editingKey = labelKey(label);
+    this.createName = label.name;
+    this.createColor = label.color || DEFAULT_LABEL_COLOR;
+    this.render();
+  }
+
+  render() {
+    this.contentEl.replaceChildren();
+    this.contentEl.addClass("ot-label-modal");
+
+    if (this.creating) {
+      this.renderCreateScreen();
+      return;
+    }
+
+    const header = createElement("div", "ot-label-modal-header");
+    header.append(createElement("h2", "", "Labels"));
+
+    const search = createElement("input", "ot-label-search");
+    search.type = "text";
+    search.placeholder = "Search labels";
+    search.value = this.query;
+    search.addEventListener("input", () => {
+      this.query = search.value;
+      renderList();
+    });
+
+    const labelTitle = createElement("h3", "ot-label-modal-subtitle", "Labels");
+    const list = createElement("div", "ot-label-picker-list");
+    const createArea = createElement("div", "ot-label-create-area");
+
+    const renderList = () => {
+      const query = this.query.trim().toLowerCase();
+      list.replaceChildren();
+
+      this.labels
+        .filter((label) => !query || label.name.toLowerCase().includes(query))
+        .forEach((label) => {
+          const row = createElement("div", "ot-label-option-row");
+          const checkbox = createElement("input");
+          checkbox.type = "checkbox";
+          checkbox.checked = this.isSelected(label);
+
+          const labelButton = createElement("button", "ot-label-option", label.name);
+          labelButton.type = "button";
+          labelButton.style.backgroundColor = label.color || "#2f6fd6";
+
+          const edit = iconButton("pencil", "Edit label", (event) => {
+            event.stopPropagation();
+            this.editLabel(label);
+          });
+
+          checkbox.addEventListener("change", () => this.toggleLabel(label));
+          labelButton.addEventListener("click", () => this.toggleLabel(label));
+          row.append(checkbox, labelButton, edit);
+          list.append(row);
+        });
+    };
+
+    const renderCreateArea = () => {
+      createArea.replaceChildren();
+
+      const create = createElement("button", "ot-label-create-button", "Create new label");
+      create.type = "button";
+      create.addEventListener("click", () => {
+        this.creating = true;
+        this.editingKey = null;
+        this.createName = this.query;
+        this.createColor = DEFAULT_LABEL_COLOR;
+        this.render();
+      });
+      createArea.append(create);
+    };
+
+    this.contentEl.append(header, search, labelTitle, list, createArea);
+    renderList();
+    renderCreateArea();
+    requestAnimationFrame(() => search.focus());
+  }
+
+  renderCreateScreen() {
+    const header = createElement("div", "ot-label-modal-header");
+    const back = iconButton("arrow-left", "Back", () => {
+      this.creating = false;
+      this.editingKey = null;
+      this.render();
+    });
+    back.classList.add("ot-label-back");
+    header.append(back, createElement("h2", "", this.editingKey ? "Edit label" : "Create label"));
+
+    const previewBand = createElement("div", "ot-label-create-preview-band");
+    const preview = createElement("div", "ot-label-preview-pill", this.createName || "Label preview");
+    preview.style.backgroundColor = this.createColor;
+    previewBand.append(preview);
+
+    const form = createElement("form", "ot-label-create-screen");
+    const titleField = createElement("label", "ot-field");
+    titleField.append(createElement("span", "", "Title"));
+    const title = createElement("input", "ot-label-create-title");
+    title.type = "text";
+    title.value = this.createName;
+    title.placeholder = "Label name";
+    titleField.append(title);
+
+    const colorField = createElement("div", "ot-field");
+    colorField.append(createElement("span", "", "Choose color"));
+    const swatches = createElement("div", "ot-label-color-grid");
+    LABEL_COLORS.forEach((color) => {
+      const swatch = createElement("button", "ot-label-color-swatch");
+      swatch.type = "button";
+      swatch.style.backgroundColor = color;
+      swatch.setAttribute("aria-label", color);
+      if (color === this.createColor) {
+        swatch.classList.add("is-selected");
+        try {
+          setIcon(swatch, "check");
+        } catch (error) {
+          swatch.textContent = "✓";
+        }
+      }
+      swatch.addEventListener("click", () => {
+        this.createColor = color;
+        this.render();
+      });
+      swatches.append(swatch);
+    });
+    colorField.append(swatches);
+
+    const removeColor = textButton("x", "Remove color", () => {
+      this.createColor = "#6f737a";
+      this.render();
+    });
+    removeColor.classList.add("ot-remove-color-button");
+
+    const footer = createElement("div", "ot-label-create-footer");
+    const create = createElement("button", "mod-cta", this.editingKey ? "Save" : "Create");
+    create.type = "submit";
+    footer.append(create);
+
+    title.addEventListener("input", () => {
+      this.createName = title.value;
+      preview.textContent = this.createName || "Label preview";
+    });
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      this.createLabel(title.value, this.createColor);
+    });
+
+    form.append(titleField, colorField, removeColor, footer);
+    this.contentEl.append(header, previewBand, form);
+    requestAnimationFrame(() => title.focus());
+  }
+}
+
+class CardDatesModal extends Modal {
+  constructor(app, plugin, cardId) {
+    super(app);
+    this.plugin = plugin;
+    this.cardId = cardId;
+    this.activeField = "due";
+    this.startDate = "";
+    this.dueDate = "";
+    this.visibleMonth = new Date();
+  }
+
+  onOpen() {
+    const card = this.plugin.data.cards[this.cardId];
+    if (!card) {
+      this.close();
+      return;
+    }
+
+    this.card = card;
+    this.startDate = cleanDate(card.startDate);
+    this.dueDate = cleanDate(card.dueDate);
+    this.activeField = this.startDate && !this.dueDate ? "start" : "due";
+    const seed = dateFromISO(this.dueDate || this.startDate) || new Date();
+    this.visibleMonth = new Date(seed.getFullYear(), seed.getMonth(), 1);
+    this.render();
+  }
+
+  render() {
+    this.contentEl.replaceChildren();
+    this.contentEl.addClass("ot-date-modal");
+    this.contentEl.append(createElement("h2", "", "Dates"));
+
+    this.contentEl.append(this.renderCalendar(), this.renderDateFields(), this.renderActions());
+  }
+
+  renderCalendar() {
+    const calendar = createElement("div", "ot-date-calendar");
+    const nav = createElement("div", "ot-date-calendar-nav");
+    const title = createElement("div", "ot-date-month-title");
+    title.textContent = new Intl.DateTimeFormat(undefined, { month: "long", year: "numeric" }).format(this.visibleMonth);
+
+    nav.append(
+      iconButton("chevrons-left", "Previous year", () => {
+        this.visibleMonth = addMonths(this.visibleMonth, -12);
+        this.render();
+      }),
+      iconButton("chevron-left", "Previous month", () => {
+        this.visibleMonth = addMonths(this.visibleMonth, -1);
+        this.render();
+      }),
+      title,
+      iconButton("chevron-right", "Next month", () => {
+        this.visibleMonth = addMonths(this.visibleMonth, 1);
+        this.render();
+      }),
+      iconButton("chevrons-right", "Next year", () => {
+        this.visibleMonth = addMonths(this.visibleMonth, 12);
+        this.render();
+      })
+    );
+
+    const weekdays = createElement("div", "ot-date-weekdays");
+    const monday = new Date(2024, 0, 1);
+    for (let index = 0; index < 7; index += 1) {
+      const date = new Date(monday.getFullYear(), monday.getMonth(), monday.getDate() + index);
+      weekdays.append(createElement("span", "", new Intl.DateTimeFormat(undefined, { weekday: "short" }).format(date).replace(/\.$/, "")));
+    }
+
+    const grid = createElement("div", "ot-date-grid");
+    const firstDay = new Date(this.visibleMonth.getFullYear(), this.visibleMonth.getMonth(), 1);
+    const mondayOffset = (firstDay.getDay() + 6) % 7;
+    const firstCell = new Date(firstDay.getFullYear(), firstDay.getMonth(), firstDay.getDate() - mondayOffset);
+
+    for (let index = 0; index < 42; index += 1) {
+      const date = new Date(firstCell.getFullYear(), firstCell.getMonth(), firstCell.getDate() + index);
+      const iso = isoFromDate(date);
+      const button = createElement("button", "ot-date-day", String(date.getDate()));
+      button.type = "button";
+      if (date.getMonth() !== this.visibleMonth.getMonth()) button.classList.add("is-outside");
+      if (iso === this.startDate || iso === this.dueDate) button.classList.add("is-selected");
+      if (this.startDate && this.dueDate && iso > this.startDate && iso < this.dueDate) button.classList.add("is-range");
+      button.addEventListener("click", () => this.selectDate(iso));
+      grid.append(button);
+    }
+
+    calendar.append(nav, weekdays, grid);
+    return calendar;
+  }
+
+  renderDateFields() {
+    const fields = createElement("div", "ot-date-fields");
+    fields.append(
+      this.renderDateField("start", "Start date", this.startDate),
+      this.renderDateField("due", "Due date", this.dueDate)
+    );
+    return fields;
+  }
+
+  renderDateField(field, label, value) {
+    const wrap = createElement("div", "ot-date-field");
+    wrap.append(createElement("span", "ot-date-field-label", label));
+
+    const row = createElement("div", "ot-date-field-row");
+    const checkbox = createElement("input", "ot-date-checkbox");
+    checkbox.type = "checkbox";
+    checkbox.checked = !!value;
+    checkbox.addEventListener("change", () => {
+      this.activeField = field;
+      if (!checkbox.checked) this[field === "start" ? "startDate" : "dueDate"] = "";
+      this.render();
+    });
+
+    const dateButton = createElement("button", `ot-date-field-button${value ? "" : " is-empty"}`, fieldDateLabel(value));
+    dateButton.type = "button";
+    if (this.activeField === field) dateButton.classList.add("is-active");
+    dateButton.addEventListener("click", () => {
+      this.activeField = field;
+      this.render();
+    });
+
+    row.append(checkbox, dateButton);
+    wrap.append(row);
+    return wrap;
+  }
+
+  renderActions() {
+    const actions = createElement("div", "ot-modal-actions");
+    const clear = createElement("button", "", "Clear dates");
+    const cancel = createElement("button", "", "Cancel");
+    const save = createElement("button", "mod-cta", "Save");
+
+    [clear, cancel, save].forEach((button) => {
+      button.type = "button";
+    });
+
+    clear.addEventListener("click", async () => {
+      await this.plugin.updateCard(this.card.id, { startDate: "", dueDate: "" });
+      this.close();
+    });
+    cancel.addEventListener("click", () => this.close());
+    save.addEventListener("click", async () => {
+      await this.plugin.updateCard(this.card.id, {
+        startDate: this.startDate,
+        dueDate: this.dueDate,
+      });
+      this.close();
+    });
+
+    actions.append(clear, cancel, save);
+    return actions;
+  }
+
+  selectDate(date) {
+    if (this.activeField === "start") {
+      this.startDate = date;
+      if (this.dueDate && this.dueDate < date) this.dueDate = "";
+    } else {
+      this.dueDate = date;
+      if (this.startDate && this.startDate > date) this.startDate = "";
+    }
+    this.render();
+  }
+}
+
+class AboutModal extends Modal {
+  constructor(app, plugin) {
+    super(app);
+    this.plugin = plugin;
+  }
+
+  onOpen() {
+    this.contentEl.replaceChildren();
+    this.contentEl.addClass("ot-about-modal");
+    this.contentEl.append(
+      createElement("h2", "", "Task Deck"),
+      createElement("p", "", "A Trello-style task board for Obsidian with Markdown-backed cards, labels, dates, and checklists.")
+    );
+
+    const actions = createElement("div", "ot-modal-actions");
+    const openSettings = createElement("button", "", "Open settings");
+    const sync = createElement("button", "", "Sync notes");
+    const close = createElement("button", "mod-cta", "Close");
+    [openSettings, sync, close].forEach((button) => {
+      button.type = "button";
+    });
+    openSettings.addEventListener("click", () => {
+      this.app.setting.open();
+      this.app.setting.openTabById(this.plugin.manifest.id);
+      this.close();
+    });
+    sync.addEventListener("click", async () => {
+      await this.plugin.syncCardsFromFolder();
+      this.plugin.refreshViews();
+      new Notice("Task Deck synced.");
+    });
+    close.addEventListener("click", () => this.close());
+    actions.append(openSettings, sync, close);
+    this.contentEl.append(actions);
+  }
+}
+
+class CardModal extends Modal {
+  constructor(app, plugin, cardId) {
+    super(app);
+    this.plugin = plugin;
+    this.cardId = cardId;
+    this.localLabels = [];
+    this.localGlobalLabels = [];
+    this.localDetails = "";
+    this.localChecklist = [];
+    this.detailsTextarea = null;
+    this.addingChecklistItem = false;
+  }
+
+  onOpen() {
+    this.contentEl.replaceChildren(createElement("div", "ot-loading", "Opening card..."));
+    this.load().catch((error) => {
+      console.error(error);
+      new Notice("Could not open card.");
+      this.close();
+    });
+  }
+
+  async load() {
+    const card = this.plugin.data.cards[this.cardId];
+    if (!card) {
+      new Notice("Card not found.");
+      this.close();
+      return;
+    }
+
+    await this.plugin.hydrateCardFromFile(card);
+    this.card = card;
+    this.localLabels = clone(card.labels || []);
+    this.localGlobalLabels = clone(this.plugin.data.labels || []);
+    this.localLabels.forEach((label) => this.ensureLocalGlobalLabel(label));
+    this.localDetails = card.details || "";
+    this.localChecklist = clone(card.checklist || []);
+    this.render();
+  }
+
+  ensureLocalGlobalLabel(label) {
+    const name = cleanLabelName(label);
+    if (!name) return null;
+
+    const key = labelKey(name);
+    const existing = this.localGlobalLabels.find((item) => labelKey(item) === key);
+    if (existing) return existing;
+
+    const globalLabel = { name, color: label.color || "#d43c35" };
+    this.localGlobalLabels.push(globalLabel);
+    return globalLabel;
+  }
+
+  isSelectedLabel(label) {
+    const key = labelKey(label);
+    return this.localLabels.some((item) => labelKey(item) === key);
+  }
+
+  render() {
+    const card = this.card;
+    this.contentEl.replaceChildren();
+    this.contentEl.addClass("ot-card-modal");
+
+    const title = createElement("input", "ot-title-input");
+    title.type = "text";
+    title.value = card.title;
+    title.placeholder = "Card title";
+
+    const labelsField = this.renderLabelsField();
+    const detailsField = this.renderDetailsField();
+    const checklistField = this.renderChecklistField();
+
+    const actions = createElement("div", "ot-modal-actions");
+    const deleteButton = createElement("button", "mod-warning", "Delete");
+    const openNote = createElement("button", "", "Open note");
+    const cancel = createElement("button", "", "Cancel");
+    const save = createElement("button", "mod-cta", "Save");
+
+    [deleteButton, openNote, cancel, save].forEach((button) => {
+      button.type = "button";
+    });
+
+    deleteButton.addEventListener("click", async () => {
+      if (!window.confirm("Delete this card and its linked Markdown note?")) return;
+      await this.plugin.deleteCard(card.id);
+      this.close();
+    });
+
+    openNote.addEventListener("click", async () => {
+      await this.saveFromForm(title);
+      await this.plugin.openCardFile(card.id);
+      this.close();
+    });
+
+    cancel.addEventListener("click", () => this.close());
+    save.addEventListener("click", async () => {
+      await this.saveFromForm(title);
+      this.close();
+    });
+
+    actions.append(deleteButton, openNote, cancel, save);
+
+    this.contentEl.append(title, labelsField, detailsField, checklistField, actions);
+    requestAnimationFrame(() => title.focus());
+  }
+
+  renderLabelsField() {
+    const field = createElement("div", "ot-field ot-label-editor");
+    field.append(createElement("span", "", "Labels"));
+    const labelsWrap = createElement("div", "ot-selected-labels");
+    const addButton = iconButton("plus", "Choose labels", () => {
+      new LabelPickerModal(this.app, this.localGlobalLabels, this.localLabels, (labels, selectedLabels) => {
+        this.localGlobalLabels = labels;
+        this.localLabels = selectedLabels;
+        renderLabels();
+      }).open();
+    });
+    addButton.classList.add("ot-label-add-button");
+
+    const renderLabels = () => {
+      labelsWrap.replaceChildren();
+
+      this.localLabels.forEach((label, index) => {
+        const pill = createElement("button", "ot-large-label-pill");
+        pill.type = "button";
+        pill.textContent = label.name;
+        pill.style.backgroundColor = label.color;
+        pill.title = "Remove label";
+        pill.addEventListener("click", () => {
+          this.localLabels.splice(index, 1);
+          renderLabels();
+        });
+        labelsWrap.append(pill);
+      });
+
+      labelsWrap.append(addButton);
+    };
+    renderLabels();
+    field.append(labelsWrap);
+    return field;
+  }
+
+  renderDetailsField() {
+    const field = createElement("div", "ot-field");
+    const header = createElement("div", "ot-field-row");
+    header.append(createElement("span", "", "Details"));
+    field.append(header);
+
+    const preview = createElement("div", "ot-markdown-preview");
+    const editor = createElement("textarea", "ot-textarea ot-details-editor is-hidden");
+    editor.placeholder = "Card notes...";
+    editor.value = this.localDetails;
+    this.detailsTextarea = editor;
+
+    const renderPreview = () => {
+      preview.replaceChildren();
+      if (!this.localDetails.trim()) {
+        preview.append(createElement("span", "ot-empty-text", "No details"));
+        return;
+      }
+
+      Promise.resolve(
+        MarkdownRenderer.render(this.app, this.localDetails, preview, this.card.filePath || "", this)
+      ).catch(console.error);
+    };
+
+    const showEditor = () => {
+      editor.value = this.localDetails;
+      preview.classList.add("is-hidden");
+      editor.classList.remove("is-hidden");
+      requestAnimationFrame(() => editor.focus());
+    };
+
+    const showPreview = () => {
+      this.localDetails = editor.value;
+      editor.classList.add("is-hidden");
+      preview.classList.remove("is-hidden");
+      renderPreview();
+    };
+
+    header.append(iconButton("pencil", "Edit details", showEditor));
+    preview.addEventListener("click", showEditor);
+    editor.addEventListener("input", () => {
+      this.localDetails = editor.value;
+    });
+    editor.addEventListener("blur", showPreview);
+
+    renderPreview();
+    field.append(preview, editor);
+    return field;
+  }
+
+  renderChecklistField() {
+    const field = createElement("div", "ot-field");
+    const header = createElement("div", "ot-checklist-header");
+    const heading = createElement("div", "ot-checklist-heading");
+    const headingIcon = createElement("span", "ot-checklist-heading-icon");
+    try {
+      setIcon(headingIcon, "check-square");
+    } catch (error) {
+      headingIcon.textContent = "☑";
+    }
+    heading.append(headingIcon, createElement("span", "", "Checklist"));
+    header.append(heading);
+
+    const progress = createElement("div", "ot-checklist-progress");
+    const progressText = createElement("span", "ot-checklist-percent", "0%");
+    const progressTrack = createElement("div", "ot-progress-track");
+    const progressFill = createElement("div", "ot-progress-fill");
+    progressTrack.append(progressFill);
+    progress.append(progressText, progressTrack);
+
+    const list = createElement("div", "ot-checklist");
+    const updateProgress = () => {
+      const stats = checklistStats(this.localChecklist);
+      progressText.textContent = `${stats.percent}%`;
+      progressFill.style.width = `${stats.percent}%`;
+    };
+
+    const renderChecklist = () => {
+      list.replaceChildren();
+      if (!this.localChecklist.length) {
+        list.append(createElement("span", "ot-empty-text", "No checklist items"));
+      }
+
+      this.localChecklist.forEach((item, index) => {
+        const row = createElement("div", "ot-checklist-row");
+        const checkbox = createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.checked = !!item.done;
+        const input = createElement("input", "ot-checklist-title");
+        input.type = "text";
+        input.value = item.text || "";
+        const remove = iconButton("x", "Remove item", () => {
+          this.localChecklist.splice(index, 1);
+          renderChecklist();
+        });
+        remove.addEventListener("click", (event) => event.stopPropagation());
+
+        checkbox.addEventListener("change", () => {
+          item.done = checkbox.checked;
+          updateProgress();
+        });
+        input.addEventListener("input", () => {
+          item.text = input.value;
+        });
+        row.append(checkbox, input, remove);
+        list.append(row);
+      });
+      updateProgress();
+    };
+
+    const addArea = createElement("div", "ot-checklist-add");
+    const renderAddArea = () => {
+      addArea.replaceChildren();
+
+      if (!this.addingChecklistItem) {
+        addArea.append(textButton("plus", "Add item", () => {
+          this.addingChecklistItem = true;
+          renderAddArea();
+        }));
+        return;
+      }
+
+      const addForm = createElement("form", "ot-checklist-add-form");
+      const addInput = createElement("input", "ot-input");
+      addInput.type = "text";
+      addInput.placeholder = "Checklist item";
+      const addButton = createElement("button", "mod-cta", "Add");
+      const cancel = iconButton("x", "Cancel", () => {
+        this.addingChecklistItem = false;
+        renderAddArea();
+      });
+      addButton.type = "submit";
+      addForm.append(addInput, addButton, cancel);
+      addForm.addEventListener("submit", (event) => {
+        event.preventDefault();
+        const text = textLine(addInput.value);
+        if (!text) {
+          addInput.focus();
+          return;
+        }
+        this.localChecklist.push({ done: false, text });
+        this.addingChecklistItem = false;
+        renderChecklist();
+        renderAddArea();
+      });
+      addInput.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") {
+          this.addingChecklistItem = false;
+          renderAddArea();
+        }
+      });
+      addArea.append(addForm);
+      requestAnimationFrame(() => addInput.focus());
+    };
+
+    renderChecklist();
+    renderAddArea();
+    field.append(header, progress, list, addArea);
+    return field;
+  }
+
+  async saveFromForm(titleInput) {
+    if (this.detailsTextarea) this.localDetails = this.detailsTextarea.value;
+
+    await this.plugin.updateCard(this.card.id, {
+      title: textLine(titleInput.value) || this.card.title,
+      labels: clone(this.localLabels),
+      details: this.localDetails.trim(),
+      checklist: this.localChecklist
+        .map((item) => ({ done: !!item.done, text: textLine(item.text) }))
+        .filter((item) => item.text),
+    }, clone(this.localGlobalLabels));
+  }
+}
+
+module.exports = {
+  TextPromptModal,
+  LabelPickerModal,
+  CardDatesModal,
+  AboutModal,
+  CardModal,
+};

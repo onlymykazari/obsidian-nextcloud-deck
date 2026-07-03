@@ -1,0 +1,296 @@
+const { setIcon } = require("obsidian");
+
+const VIEW_TYPE = "obsidian-tasks-kanban-view";
+const CARD_FOLDER = "Kanban Cards";
+const LIST_DRAG_TYPE = "application/x-obsidian-tasks-kanban-list";
+const DONATION_URL = "https://buymeacoffee.com/carbon06";
+const DEFAULT_LABEL_COLOR = "#2f6fd6";
+const LABEL_COLORS = [
+  "#1f6f4a", "#8a6f00", "#a64b00", "#8b2a24", "#6f338f",
+  "#247b55", "#9a7600", "#b85f00", "#be332b", "#8a3db0",
+  "#54c99b", "#e5bd12", "#ffa51a", "#f46b66", "#c878ee",
+  "#1b4078", "#1f7082", "#426226", "#67264f", "#5d6369",
+  "#2465c7", "#2b7c8e", "#4f7822", "#a33e78", "#73787f",
+  "#68a0ee", "#70c1d8", "#96c949", "#dc6ab5", "#a3a6aa",
+];
+
+const DEFAULT_DATA = {
+  version: 1,
+  activeBoardId: "default",
+  boards: [
+    {
+      id: "default",
+      name: "Task Deck",
+      lists: [],
+    },
+  ],
+  cards: {},
+  labels: [],
+};
+
+function clone(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function uid(prefix) {
+  return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function textLine(value) {
+  return String(value || "").replace(/\r?\n/g, " ").trim();
+}
+
+function cleanDate(value) {
+  const date = textLine(value);
+  return /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : "";
+}
+
+function dateFromISO(value) {
+  const date = cleanDate(value);
+  if (!date) return null;
+
+  const [year, month, day] = date.split("-").map(Number);
+  return new Date(year, month - 1, day);
+}
+
+function isoFromDate(date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function addMonths(date, amount) {
+  return new Date(date.getFullYear(), date.getMonth() + amount, 1);
+}
+
+function shortDateLabel(value) {
+  const date = dateFromISO(value);
+  if (!date) return "";
+
+  return new Intl.DateTimeFormat(undefined, { day: "numeric", month: "short" })
+    .format(date)
+    .replace(/\.$/, "");
+}
+
+function fieldDateLabel(value) {
+  const date = dateFromISO(value);
+  if (!date) return "D.M.YYYY";
+
+  const day = String(date.getDate()).padStart(2, "0");
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  return `${day}.${month}.${date.getFullYear()}`;
+}
+
+function dateRangeLabel(startDate, dueDate) {
+  const start = cleanDate(startDate);
+  const due = cleanDate(dueDate);
+  if (start && due && start !== due) return `${shortDateLabel(start)} - ${shortDateLabel(due)}`;
+  return shortDateLabel(due || start);
+}
+
+function parseBoolean(value) {
+  const normalized = textLine(value).toLowerCase();
+  return ["true", "yes", "1", "x", "done"].includes(normalized);
+}
+
+function labelKey(label) {
+  return textLine(typeof label === "string" ? label : label && label.name).toLowerCase();
+}
+
+function cleanLabelName(label) {
+  const name = textLine(typeof label === "string" ? label : label && label.name);
+  return name === "---" ? "" : name;
+}
+
+function slugify(value) {
+  const slug = String(value || "card")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 64);
+
+  return slug || "card";
+}
+
+function createElement(tag, className, text) {
+  const element = document.createElement(tag);
+  if (className) element.className = className;
+  if (text !== undefined) element.textContent = text;
+  return element;
+}
+
+function hasDragType(event, type) {
+  const types = event.dataTransfer && event.dataTransfer.types;
+  return !!types && (Array.from(types).includes(type) || (types.contains && types.contains(type)));
+}
+
+function iconButton(icon, label, onClick) {
+  const button = createElement("button", "ot-icon-button");
+  button.type = "button";
+  button.title = label;
+  button.setAttribute("aria-label", label);
+  try {
+    setIcon(button, icon);
+  } catch (error) {
+    button.textContent = label;
+  }
+  button.addEventListener("click", onClick);
+  return button;
+}
+
+function textButton(icon, label, onClick) {
+  const button = createElement("button", "ot-text-button");
+  button.type = "button";
+
+  const iconSlot = createElement("span", "ot-button-icon");
+  try {
+    setIcon(iconSlot, icon);
+  } catch (error) {
+    iconSlot.textContent = "+";
+  }
+
+  button.append(iconSlot, createElement("span", "", label));
+  button.addEventListener("click", onClick);
+  return button;
+}
+
+function getSection(markdown, heading) {
+  const marker = `## ${heading}`;
+  const start = markdown.indexOf(marker);
+  if (start === -1) return "";
+
+  const body = markdown.slice(start + marker.length);
+  const nextHeading = body.search(/\n## /);
+  return (nextHeading === -1 ? body : body.slice(0, nextHeading)).trim();
+}
+
+function getSectionAny(markdown, headings) {
+  for (const heading of headings) {
+    const section = getSection(markdown, heading);
+    if (section) return section;
+  }
+  return "";
+}
+
+function parseChecklist(text) {
+  return String(text || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const match = line.match(/^(?:-\s*)?\[([ xX])\]\s*(.*)$/);
+      if (!match) {
+        return { done: false, text: line.replace(/^- /, "").trim() };
+      }
+
+      return {
+        done: match[1].toLowerCase() === "x",
+        text: match[2].trim(),
+      };
+    })
+    .filter((item) => item.text);
+}
+
+function checklistToText(items) {
+  return (items || [])
+    .map((item) => `[${item.done ? "x" : " "}] ${item.text}`)
+    .join("\n");
+}
+
+function checklistToMarkdown(items) {
+  return (items || [])
+    .map((item) => `- [${item.done ? "x" : " "}] ${textLine(item.text)}`)
+    .join("\n");
+}
+
+function checklistStats(items) {
+  const total = (items || []).length;
+  const done = (items || []).filter((item) => item.done).length;
+  return {
+    done,
+    total,
+    percent: total ? Math.round((done / total) * 100) : 0,
+  };
+}
+
+function parseLabels(raw) {
+  return String(raw || "")
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part) => {
+      const [name, color] = part.split("|").map((item) => item.trim());
+      return { name, color: color || "#d43c35" };
+    })
+    .filter((label) => label.name);
+}
+
+function labelsToFrontmatter(labels) {
+  return (labels || [])
+    .map((label) => `${textLine(label.name)}|${textLine(label.color || "#d43c35")}`)
+    .join(", ");
+}
+
+function parseCardMarkdown(markdown) {
+  const idMatch = markdown.match(/^kanban-card-id:\s*(.*)$/m);
+  const boardMatch = markdown.match(/^kanban-board-id:\s*(.*)$/m);
+  const listMatch = markdown.match(/^kanban-list-id:\s*(.*)$/m);
+  const titleMatch = markdown.match(/^#\s+(.+)$/m);
+  const labelsMatch = markdown.match(/^labels:\s*(.*)$/m);
+  const completedMatch = markdown.match(/^completed:\s*(.*)$/m);
+  const startMatch = markdown.match(/^start:\s*(.*)$/m);
+  const dueMatch = markdown.match(/^due:\s*(.*)$/m);
+
+  return {
+    id: idMatch ? textLine(idMatch[1]) : "",
+    boardId: boardMatch ? textLine(boardMatch[1]) : "",
+    listId: listMatch ? textLine(listMatch[1]) : "",
+    title: titleMatch ? titleMatch[1].trim() : "",
+    labels: labelsMatch ? parseLabels(labelsMatch[1]) : [],
+    completed: completedMatch ? parseBoolean(completedMatch[1]) : null,
+    startDate: startMatch ? cleanDate(startMatch[1]) : null,
+    dueDate: dueMatch ? cleanDate(dueMatch[1]) : null,
+    details: getSectionAny(markdown, ["Details", "Detaylar"]),
+    checklist: parseChecklist(getSectionAny(markdown, ["Checklist", "Yapılacaklar", "Kontrol listesi"])),
+  };
+}
+
+module.exports = {
+  VIEW_TYPE,
+  CARD_FOLDER,
+  LIST_DRAG_TYPE,
+  DONATION_URL,
+  DEFAULT_LABEL_COLOR,
+  LABEL_COLORS,
+  DEFAULT_DATA,
+  clone,
+  uid,
+  textLine,
+  cleanDate,
+  dateFromISO,
+  isoFromDate,
+  addMonths,
+  shortDateLabel,
+  fieldDateLabel,
+  dateRangeLabel,
+  parseBoolean,
+  labelKey,
+  cleanLabelName,
+  slugify,
+  createElement,
+  hasDragType,
+  iconButton,
+  textButton,
+  getSection,
+  getSectionAny,
+  parseChecklist,
+  checklistToText,
+  checklistToMarkdown,
+  checklistStats,
+  parseLabels,
+  labelsToFrontmatter,
+  parseCardMarkdown,
+};
