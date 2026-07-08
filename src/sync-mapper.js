@@ -23,6 +23,50 @@ function decodeDeckDate(raw) {
   return cleanDate(String(raw).slice(0, 10));
 }
 
+// Deck stores everything in `description` — there is no separate checklist
+// field. We embed our local checklist as a fenced "## Checklist" section at
+// the end of the description so it survives round-trips through Deck's
+// Markdown renderer without being reinterpreted as inline bullets.
+//
+// splitDescriptionWithChecklist(text) -> { details, checklist }
+// mergeDetailsAndChecklist({ details, checklist }) -> string
+
+const CHECKLIST_HEADING_RE = /^\s*#{1,6}\s*(?:checklist|待办|清单)\s*$/im;
+
+function splitDescriptionWithChecklist(text) {
+  const raw = typeof text === "string" ? text : "";
+  const match = raw.match(CHECKLIST_HEADING_RE);
+  if (!match) return { details: raw, checklist: [] };
+
+  const headingIndex = match.index;
+  const details = raw.slice(0, headingIndex).replace(/\s+$/g, "");
+  const rest = raw.slice(headingIndex + match[0].length).replace(/^\r?\n/, "");
+  const checklist = [];
+  const lines = rest.split(/\r?\n/);
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) { if (!checklist.length) continue; else break; }
+    const m = trimmed.match(/^-\s*\[([ xX])\]\s*(.*)$/);
+    if (m) {
+      const cleaned = m[2].replace(/\s*<!--@.*?-->\s*$/, "").trim();
+      if (cleaned) checklist.push({ done: m[1].toLowerCase() === "x", text: cleaned });
+      continue;
+    }
+    // Stop at the first non-checklist, non-empty line so we don't slurp
+    // unrelated content that happens to sit under the heading.
+    break;
+  }
+  return { details, checklist };
+}
+
+function mergeDetailsAndChecklist(details, checklist) {
+  const base = typeof details === "string" ? details.replace(/\s+$/g, "") : "";
+  const items = Array.isArray(checklist) ? checklist : [];
+  if (!items.length) return base;
+  const rendered = items.map((item) => `- [${item && item.done ? "x" : " "}] ${String((item && item.text) || "").trim()}`).join("\n");
+  return `${base ? `${base}\n\n` : ""}## Checklist\n${rendered}`;
+}
+
 /**
  * Convert a remote card payload into the local card shape. Assignees are
  * preserved as-is (uid + display name) so future team support can round-trip
@@ -64,13 +108,19 @@ function remoteCardToLocal(remoteCard, { boardId, listId }) {
     details: typeof remoteCard.description === "string" ? remoteCard.description : "",
     labels,
     assignees,
-    checklist: [], // Deck has no first-class checklist; extraction from description is deferred
+    checklist: [],
     completed: !!remoteCard.done, // Deck cards may carry `done` when archived; treat as complete for UX parity
     startDate: null,
     dueDate: decodeDeckDate(remoteCard.duedate),
     filePath: "", // assigned when the note is written to the vault
     position: typeof remoteCard.order === "number" ? remoteCard.order : null,
   };
+  // Deck has no first-class checklist; extract our "## Checklist" section
+  // from the description if present, and strip it from `details` so both
+  // sides don't render it twice.
+  const split = splitDescriptionWithChecklist(card.details);
+  card.details = split.details;
+  card.checklist = split.checklist;
   card.baseline = snapshotBaseline(card);
   return card;
 }
@@ -99,6 +149,7 @@ function mergeRemoteCardOntoLocal(existing, remoteCard, { boardId, listId }) {
   if (!existing.localDirty) {
     merged.title = remote.title;
     merged.details = remote.details;
+    merged.checklist = remote.checklist;
     merged.labels = remote.labels;
     merged.assignees = remote.assignees;
     merged.completed = remote.completed;
@@ -120,7 +171,10 @@ function localCardToDeckPatch(card, { owner } = {}) {
   const payload = {
     title: card.title || "Untitled card",
     type: "plain",
-    description: card.details || "",
+    // Merge our checklist back into the description so Deck's UI + this
+    // plugin see the same text. Round-trips cleanly because
+    // splitDescriptionWithChecklist reverses this on pull.
+    description: mergeDetailsAndChecklist(card.details || "", card.checklist),
     order: typeof card.position === "number" ? card.position : 0,
     duedate: card.dueDate ? new Date(`${card.dueDate}T00:00:00Z`).toISOString() : null,
   };
@@ -212,6 +266,8 @@ function isRemoteTracked(card) {
 module.exports = {
   decodeDeckColor,
   decodeDeckDate,
+  splitDescriptionWithChecklist,
+  mergeDetailsAndChecklist,
   remoteCardToLocal,
   mergeRemoteCardOntoLocal,
   localCardToDeckPatch,

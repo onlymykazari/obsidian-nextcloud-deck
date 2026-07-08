@@ -175,4 +175,51 @@ test("reconcileBoardStructure keeps existing lists by remoteId even after rename
   assert.deepStrictEqual(next.lists[0].cardIds, ["c1"], "card assignments untouched by structure reconcile");
 });
 
+test("splitDescriptionWithChecklist extracts checklist from description tail", () => {
+  const raw = "hello\n\n## Checklist\n- [ ] first\n- [x] second";
+  const out = mapper.splitDescriptionWithChecklist(raw);
+  assert.strictEqual(out.details, "hello");
+  assert.deepStrictEqual(out.checklist, [
+    { done: false, text: "first" },
+    { done: true, text: "second" },
+  ]);
+});
+
+test("splitDescriptionWithChecklist returns empty checklist when no heading", () => {
+  const out = mapper.splitDescriptionWithChecklist("body without a checklist");
+  assert.deepStrictEqual(out.checklist, []);
+  assert.strictEqual(out.details, "body without a checklist");
+});
+
+test("mergeDetailsAndChecklist round-trips through split", () => {
+  const merged = mapper.mergeDetailsAndChecklist("body", [{ done: false, text: "a" }, { done: true, text: "b" }]);
+  assert.ok(merged.includes("## Checklist"));
+  const split = mapper.splitDescriptionWithChecklist(merged);
+  assert.strictEqual(split.details, "body");
+  assert.deepStrictEqual(split.checklist, [
+    { done: false, text: "a" },
+    { done: true, text: "b" },
+  ]);
+});
+
+test("remoteCardToLocal moves description checklist into card.checklist", () => {
+  const local = mapper.remoteCardToLocal({
+    id: 7, title: "T", description: "hi\n\n## Checklist\n- [ ] test\n- [ ] 222test",
+    ETag: "e", lastModified: 1,
+  }, { boardId: "b", listId: "l" });
+  assert.strictEqual(local.details, "hi");
+  assert.strictEqual(local.checklist.length, 2);
+  assert.strictEqual(local.checklist[0].text, "test");
+  assert.strictEqual(local.checklist[1].text, "222test");
+});
+
+test("localCardToDeckPatch embeds checklist inside description", () => {
+  const patch = mapper.localCardToDeckPatch({
+    title: "T", details: "hi", checklist: [{ done: false, text: "a" }, { done: true, text: "b" }],
+  });
+  assert.ok(patch.description.includes("## Checklist"));
+  assert.ok(patch.description.includes("- [ ] a"));
+  assert.ok(patch.description.includes("- [x] b"));
+});
+
 console.log(`\n${passed} tests passed.`);
