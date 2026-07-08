@@ -1872,3 +1872,66 @@
   margin-top: 12px;
 }
 
+/* Sync log viewer */
+
+.ot-sync-log-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.ot-sync-log-summary {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.ot-sync-log-buttons {
+  display: flex;
+  gap: 6px;
+}
+
+.ot-sync-log-list {
+  max-height: 50vh;
+  overflow-y: auto;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+}
+
+.ot-sync-log-row {
+  display: grid;
+  grid-template-columns: 80px 160px 1fr;
+  gap: 8px;
+  padding: 6px 10px;
+  border-top: 1px solid var(--background-modifier-border);
+  font-size: 12px;
+}
+
+.ot-sync-log-row:first-child { border-top: none; }
+
+.ot-sync-log-row.is-error {
+  background: var(--background-modifier-error);
+  color: var(--text-on-accent);
+}
+
+.ot-sync-log-time { color: var(--text-muted); }
+
+.ot-sync-log-event {
+  font-family: var(--font-monospace);
+  color: var(--text-normal);
+}
+
+.ot-sync-log-summary-cell {
+  color: var(--text-muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.ot-sync-log-empty {
+  padding: 12px;
+  text-align: center;
+  color: var(--text-muted);
+  font-style: italic;
+}
+

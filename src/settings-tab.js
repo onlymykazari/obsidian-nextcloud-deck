@@ -9,6 +9,7 @@ const {
   pollLoginFlow,
   testConnection,
 } = require("./nextcloud-auth");
+const { SyncLogModal } = require("./sync-log-modal");
 
 const CONFLICT_OPTIONS = [
   { value: "prompt", label: "Ask me (recommended)" },
@@ -320,6 +321,17 @@ class TaskDeckSettingTab extends PluginSettingTab {
               attachmentsEnabled: value,
             });
             await this.plugin.saveData(this.plugin.data);
+          });
+      });
+
+    new Setting(containerEl)
+      .setName("Sync log")
+      .setDesc("Inspect the last ~200 sync events. Copy diagnostics to include with bug reports.")
+      .addButton((button) => {
+        button
+          .setButtonText("View sync log")
+          .onClick(() => {
+            new SyncLogModal(this.app, this.plugin).open();
           });
       });
   }

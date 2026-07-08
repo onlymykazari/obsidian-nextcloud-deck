@@ -117,6 +117,27 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
         }
       },
     });
+    this.addCommand({
+      id: "sync-with-nextcloud",
+      name: "Sync with Nextcloud Deck",
+      callback: async () => {
+        if (!this.isNextcloudEnabled()) {
+          new Notice("Nextcloud is not connected. Open Settings → Nextcloud sync to sign in.");
+          return;
+        }
+        const status = await this.runNextcloudSync({ manual: true });
+        if (status && status.state === "error") new Notice(`Sync failed: ${status.message}`);
+        else if (status && status.message) new Notice(status.message);
+      },
+    });
+    this.addCommand({
+      id: "view-sync-log",
+      name: "View Nextcloud sync log",
+      callback: () => {
+        const { SyncLogModal } = require("./sync-log-modal");
+        new SyncLogModal(this.app, this).open();
+      },
+    });
   }
 
   async onunload() {
