@@ -7332,6 +7332,21 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
     if (board) card.boardId = board.id;
     await this.ensureBoardFolder(board);
     const list = this.findList(card.listId, board);
+    // Guard against a missing / directory-shaped filePath. This can happen
+    // when a card entered `data.cards` from Nextcloud pull without ever
+    // having a note materialized (remoteCardToLocal returns filePath="").
+    // Without this guard, adapter.write("") targets the vault root and
+    // Node throws EISDIR.
+    if (!card.filePath || !/\.md$/i.test(card.filePath)) {
+      const generated = await this.nextCardPath(card.title || "Untitled card", null, board);
+      this.debugLog({
+        event: "writeCardFile.assign-path",
+        cardId: card.id,
+        oldPath: card.filePath,
+        newPath: generated,
+      });
+      card.filePath = generated;
+    }
     const tags = await this.cardTags(card, this.taskDeckTag(board, list));
     // Position within the list, from the live cardIds order. This is the ONLY
     // place card order is persisted to a synced file (data.json order does not
