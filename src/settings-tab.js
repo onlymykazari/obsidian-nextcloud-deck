@@ -1,8 +1,11 @@
 const { Notice, PluginSettingTab, Setting } = require("obsidian");
 
-// Settings tab for board access, card-note sync, Nextcloud sync, support, and
-// version info.
-const { DONATION_URL } = require("./helpers");
+// Settings tab for board access, card-note sync, Nextcloud sync, and version
+// info. The upstream "Support development" donation button was intentionally
+// removed here — the fork's substantial deviation from upstream (full
+// Nextcloud sync stack) means it should not silently direct donations at
+// the original author's link. Credit to the upstream project stays in
+// README.md.
 const {
   normalizeServerUrl,
   startLoginFlow,
@@ -92,17 +95,8 @@ class TaskDeckSettingTab extends PluginSettingTab {
       });
 
     new Setting(containerEl)
-      .setName("Support development")
-      .setDesc("Open the donation page.")
-      .addButton((button) => {
-        button
-          .setButtonText("Donate")
-          .onClick(() => window.open(DONATION_URL, "_blank"));
-      });
-
-    new Setting(containerEl)
       .setName("Version")
-      .setDesc(this.plugin.manifest.version || "0.4.0");
+      .setDesc(this.plugin.manifest.version || "0.5.0");
   }
 
   hide() {

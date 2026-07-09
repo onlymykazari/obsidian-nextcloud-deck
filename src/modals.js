@@ -1554,8 +1554,18 @@ class CardModal extends Modal {
     this.savePromise = this.savePromise
       .then(() => this.plugin.updateCard(card.id, patch, globalLabels))
       .catch((error) => {
-        console.error(error);
-        new Notice("Could not save card.");
+        // Surface the real error so users can share it via the sync log
+        // instead of the opaque "Could not save card." message.
+        console.error("[Nextcloud Deck] save card failed", error);
+        const detail = (error && (error.message || error.toString())) || "unknown error";
+        new Notice(`Could not save card: ${detail}`);
+        if (this.plugin && typeof this.plugin.pushSyncLog === "function") {
+          this.plugin.pushSyncLog({
+            event: "save-card-failed",
+            cardId: card && card.id,
+            message: detail,
+          });
+        }
       });
 
     await this.savePromise;

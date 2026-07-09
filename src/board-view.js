@@ -2,7 +2,6 @@ const { ItemView, Menu, Notice, setIcon } = require("obsidian");
 
 // Renders the kanban board and handles inline card/list interactions.
 const {
-  DONATION_URL,
   LIST_DRAG_TYPE,
   TASK_DECK_ICON,
   VIEW_TYPE,
@@ -76,7 +75,6 @@ class BoardView extends ItemView {
     actions.append(textButton("plus-square", "New board", () => this.plugin.createBoardPrompt()));
     actions.append(
       textButton("info", "About", () => new AboutModal(this.app, this.plugin).open()),
-      textButton("heart", "Support", () => window.open(DONATION_URL, "_blank")),
       textButton("plus", "Add list", () => this.plugin.addList())
     );
     toolbar.append(actions);
@@ -111,8 +109,7 @@ class BoardView extends ItemView {
     welcomeActions.append(textButton("plus", "Create board", () => this.plugin.createBoardPrompt()));
     welcomeActions.append(
       textButton("refresh-cw", "Sync", () => this.syncNotes()),
-      textButton("info", "About", () => new AboutModal(this.app, this.plugin).open()),
-      textButton("heart", "Support developer", () => window.open(DONATION_URL, "_blank"))
+      textButton("info", "About", () => new AboutModal(this.app, this.plugin).open())
     );
     welcome.append(welcomeCopy, welcomeActions);
 

@@ -20,7 +20,6 @@ const TASK_DECK_ICON_SVG = `
   </g>
 `;
 const LIST_DRAG_TYPE = "application/x-task-deck-list";
-const DONATION_URL = "https://buymeacoffee.com/carbon06";
 const IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif", "ico"];
 const DEFAULT_LABEL_COLOR = "#2f6fd6";
 const LABEL_COLORS = [
@@ -637,7 +636,6 @@ module.exports = {
   TASK_DECK_ICON,
   TASK_DECK_ICON_SVG,
   LIST_DRAG_TYPE,
-  DONATION_URL,
   IMAGE_EXTENSIONS,
   DEFAULT_LABEL_COLOR,
   LABEL_COLORS,

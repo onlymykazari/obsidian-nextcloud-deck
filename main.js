@@ -23,7 +23,6 @@ const TASK_DECK_ICON_SVG = `
   </g>
 `;
 const LIST_DRAG_TYPE = "application/x-task-deck-list";
-const DONATION_URL = "https://buymeacoffee.com/carbon06";
 const IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif", "ico"];
 const DEFAULT_LABEL_COLOR = "#2f6fd6";
 const LABEL_COLORS = [
@@ -640,7 +639,6 @@ module.exports = {
   TASK_DECK_ICON,
   TASK_DECK_ICON_SVG,
   LIST_DRAG_TYPE,
-  DONATION_URL,
   IMAGE_EXTENSIONS,
   DEFAULT_LABEL_COLOR,
   LABEL_COLORS,
@@ -2246,8 +2244,18 @@ class CardModal extends Modal {
     this.savePromise = this.savePromise
       .then(() => this.plugin.updateCard(card.id, patch, globalLabels))
       .catch((error) => {
-        console.error(error);
-        new Notice("Could not save card.");
+        // Surface the real error so users can share it via the sync log
+        // instead of the opaque "Could not save card." message.
+        console.error("[Nextcloud Deck] save card failed", error);
+        const detail = (error && (error.message || error.toString())) || "unknown error";
+        new Notice(`Could not save card: ${detail}`);
+        if (this.plugin && typeof this.plugin.pushSyncLog === "function") {
+          this.plugin.pushSyncLog({
+            event: "save-card-failed",
+            cardId: card && card.id,
+            message: detail,
+          });
+        }
       });
 
     await this.savePromise;
@@ -2269,7 +2277,6 @@ const { ItemView, Menu, Notice, setIcon } = require("obsidian");
 
 // Renders the kanban board and handles inline card/list interactions.
 const {
-  DONATION_URL,
   LIST_DRAG_TYPE,
   TASK_DECK_ICON,
   VIEW_TYPE,
@@ -2343,7 +2350,6 @@ class BoardView extends ItemView {
     actions.append(textButton("plus-square", "New board", () => this.plugin.createBoardPrompt()));
     actions.append(
       textButton("info", "About", () => new AboutModal(this.app, this.plugin).open()),
-      textButton("heart", "Support", () => window.open(DONATION_URL, "_blank")),
       textButton("plus", "Add list", () => this.plugin.addList())
     );
     toolbar.append(actions);
@@ -2378,8 +2384,7 @@ class BoardView extends ItemView {
     welcomeActions.append(textButton("plus", "Create board", () => this.plugin.createBoardPrompt()));
     welcomeActions.append(
       textButton("refresh-cw", "Sync", () => this.syncNotes()),
-      textButton("info", "About", () => new AboutModal(this.app, this.plugin).open()),
-      textButton("heart", "Support developer", () => window.open(DONATION_URL, "_blank"))
+      textButton("info", "About", () => new AboutModal(this.app, this.plugin).open())
     );
     welcome.append(welcomeCopy, welcomeActions);
 
@@ -3247,9 +3252,12 @@ module.exports = { SyncLogModal };
   "src/settings-tab.js": function(module, exports, __require) {
 const { Notice, PluginSettingTab, Setting } = require("obsidian");
 
-// Settings tab for board access, card-note sync, Nextcloud sync, support, and
-// version info.
-const { DONATION_URL } = __require("src/helpers.js");
+// Settings tab for board access, card-note sync, Nextcloud sync, and version
+// info. The upstream "Support development" donation button was intentionally
+// removed here — the fork's substantial deviation from upstream (full
+// Nextcloud sync stack) means it should not silently direct donations at
+// the original author's link. Credit to the upstream project stays in
+// README.md.
 const {
   normalizeServerUrl,
   startLoginFlow,
@@ -3339,17 +3347,8 @@ class TaskDeckSettingTab extends PluginSettingTab {
       });
 
     new Setting(containerEl)
-      .setName("Support development")
-      .setDesc("Open the donation page.")
-      .addButton((button) => {
-        button
-          .setButtonText("Donate")
-          .onClick(() => window.open(DONATION_URL, "_blank"));
-      });
-
-    new Setting(containerEl)
       .setName("Version")
-      .setDesc(this.plugin.manifest.version || "0.4.0");
+      .setDesc(this.plugin.manifest.version || "0.5.0");
   }
 
   hide() {
