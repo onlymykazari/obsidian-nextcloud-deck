@@ -72,6 +72,10 @@ const DEFAULT_DATA = {
   completionSound: true,
   compactLabels: false,
   layoutMigrated: false,
+  // When true, plugin logs verbose diagnostics (writeCardFile paths, sync
+  // requests, mapper decisions) to both the sync log and the developer
+  // console. Off by default to keep production sessions quiet.
+  debugLogging: false,
   boards: [],
   cards: {},
   labels: [],

@@ -61,6 +61,7 @@ class SyncManager {
       // ---- Phase 1: Pull ----------------------------------------------------
       const { data: remoteBoards } = await client.getBoards();
       if (!Array.isArray(remoteBoards)) throw new Error("Unexpected boards response.");
+      this.plugin.debugLog({ event: "sync.pull.boards", count: remoteBoards.length });
 
       const bindings = this.getBindings();
       const boardMap = new Map(this.plugin.data.boards.map((board) => [board.id, board]));
@@ -72,6 +73,12 @@ class SyncManager {
         boundLocalIds.add(localBoardId);
         const remoteStacks = await this.pullBoard(client, remoteBoard, localBoardId);
         boardContext.set(localBoardId, { remoteBoard, remoteStacks });
+        this.plugin.debugLog({
+          event: "sync.pull.board-done",
+          boardId: localBoardId,
+          remoteId: remoteBoard.id,
+          stackCount: (remoteStacks || []).length,
+        });
       }
 
       this.plugin.data.nextcloud.boardBindings = bindings;
@@ -243,8 +250,21 @@ class SyncManager {
 
   async pushCreate(client, localBoard, list, card) {
     const payload = localCardToDeckCreate(card, { owner: this.plugin.data.nextcloud.username });
+    this.plugin.debugLog({
+      event: "sync.push.create.request",
+      cardId: card.id,
+      listRemoteId: list.remoteId,
+      descriptionLen: (payload.description || "").length,
+      hasChecklist: /(^|\n)#{1,6}\s*checklist/i.test(payload.description || ""),
+      // First 200 chars of the payload description so we can see the exact
+      // wire format going up to Deck. Debug-only, so users who don't enable
+      // logging never leak card content.
+      descriptionPreview: (payload.description || "").slice(0, 200),
+      checklistLen: (card.checklist || []).length,
+    });
     const { data: created } = await client.createCard(remoteBoard(localBoard), list.remoteId, payload);
     if (!created) throw new Error("Empty response from createCard");
+    this.plugin.debugLog({ event: "sync.push.create.done", cardId: card.id, remoteId: created.id });
     this.applyRemoteToCard(card, created, localBoard.id, list.id);
     card.localDirty = false;
     await this.attachments.pushCard(client, card, localBoard, list).catch((error) => {
@@ -291,8 +311,18 @@ class SyncManager {
 
     const payload = localCardToDeckPatch(card, { owner: this.plugin.data.nextcloud.username });
     const board = remoteBoard(localBoard);
+    this.plugin.debugLog({
+      event: "sync.push.update.request",
+      cardId: card.id,
+      remoteId: card.remoteId,
+      descriptionLen: (payload.description || "").length,
+      hasChecklist: /(^|\n)#{1,6}\s*checklist/i.test(payload.description || ""),
+      descriptionPreview: (payload.description || "").slice(0, 200),
+      checklistLen: (card.checklist || []).length,
+    });
     const { data: updated } = await client.updateCard(board, list.remoteId, card.remoteId, payload);
     if (!updated) throw new Error("Empty response from updateCard");
+    this.plugin.debugLog({ event: "sync.push.update.done", cardId: card.id, remoteId: card.remoteId });
     this.applyRemoteToCard(card, updated, localBoard.id, list.id);
     card.localDirty = false;
     await this.attachments.pushCard(client, card, localBoard, list).catch((error) => {

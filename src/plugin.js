@@ -344,6 +344,25 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
   }
 
   /**
+   * Emit a verbose diagnostic entry. Only records when settings.debugLogging
+   * is on; kept quiet by default so production sessions stay noise-free.
+   * Also mirrors to console.debug so users can grep the devtools console.
+   *
+   * `payload` may contain arbitrary keys; nothing sensitive should be logged
+   * (no App Password, no full card body). Keep it to identifiers, counts,
+   * status codes, and short error strings.
+   */
+  debugLog(payload) {
+    if (!this.data || !this.data.debugLogging) return;
+    const entry = Object.assign({ event: "debug" }, payload || {});
+    this.pushSyncLog(entry);
+    try {
+      // eslint-disable-next-line no-console
+      console.debug("[Nextcloud Deck debug]", entry);
+    } catch (_err) { /* console might be missing on mobile */ }
+  }
+
+  /**
    * Flag a card as having local edits that still need to be pushed. Cards that
    * were never linked to a remote board (no boardBinding) are still marked —
    * the sync manager will decide whether the board is tracked before acting.
@@ -1928,10 +1947,45 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
     ].join("\n");
 
     const file = this.app.vault.getAbstractFileByPath(card.filePath);
+    this.debugLog({
+      event: "writeCardFile",
+      cardId: card.id,
+      filePath: card.filePath,
+      hasCachedFile: !!file,
+      cachedIsMd: !!(file && file.extension === "md"),
+      title: card.title,
+      checklistLen: (card.checklist || []).length,
+    });
     if (file && file.extension === "md") {
       await this.app.vault.modify(file, markdown);
-    } else {
+      return;
+    }
+
+    // Fallback: the vault index may be stale (files re-created outside
+    // Obsidian, case-folded paths on macOS, or race conditions with sync
+    // reload). Ask the adapter directly before we create.
+    try {
+      const exists = await this.app.vault.adapter.exists(card.filePath);
+      this.debugLog({ event: "writeCardFile.adapter-exists", cardId: card.id, exists });
+      if (exists) {
+        // Read the raw file and overwrite; getAbstractFileByPath sometimes
+        // returns null for files that exist but haven't been indexed yet.
+        await this.app.vault.adapter.write(card.filePath, markdown);
+        return;
+      }
       await this.app.vault.create(card.filePath, markdown);
+    } catch (error) {
+      // Second-chance handler: if the error is "File already exists" we
+      // overwrite through the adapter. Any other error propagates so the
+      // save modal shows it to the user.
+      const message = (error && error.message) || String(error);
+      if (/already exists/i.test(message)) {
+        this.debugLog({ event: "writeCardFile.recover-existing", cardId: card.id, filePath: card.filePath, message });
+        await this.app.vault.adapter.write(card.filePath, markdown);
+        return;
+      }
+      this.debugLog({ event: "writeCardFile.failed", cardId: card.id, filePath: card.filePath, message });
+      throw error;
     }
   }
 };

@@ -75,6 +75,10 @@ const DEFAULT_DATA = {
   completionSound: true,
   compactLabels: false,
   layoutMigrated: false,
+  // When true, plugin logs verbose diagnostics (writeCardFile paths, sync
+  // requests, mapper decisions) to both the sync log and the developer
+  // console. Off by default to keep production sessions quiet.
+  debugLogging: false,
   boards: [],
   cards: {},
   labels: [],
@@ -3334,6 +3338,18 @@ class TaskDeckSettingTab extends PluginSettingTab {
       });
 
     new Setting(containerEl)
+      .setName("Debug logging")
+      .setDesc("Record verbose diagnostics (file paths, sync payloads, error stacks) to the sync log and the developer console. Leave off unless you're troubleshooting a bug.")
+      .addToggle((toggle) => {
+        toggle
+          .setValue(!!this.plugin.data.debugLogging)
+          .onChange(async (value) => {
+            this.plugin.data.debugLogging = !!value;
+            await this.plugin.savePluginData();
+          });
+      });
+
+    new Setting(containerEl)
       .setName("Version")
       .setDesc(this.plugin.manifest.version || "0.5.0");
   }
@@ -5039,6 +5055,7 @@ class SyncManager {
       // ---- Phase 1: Pull ----------------------------------------------------
       const { data: remoteBoards } = await client.getBoards();
       if (!Array.isArray(remoteBoards)) throw new Error("Unexpected boards response.");
+      this.plugin.debugLog({ event: "sync.pull.boards", count: remoteBoards.length });
 
       const bindings = this.getBindings();
       const boardMap = new Map(this.plugin.data.boards.map((board) => [board.id, board]));
@@ -5050,6 +5067,12 @@ class SyncManager {
         boundLocalIds.add(localBoardId);
         const remoteStacks = await this.pullBoard(client, remoteBoard, localBoardId);
         boardContext.set(localBoardId, { remoteBoard, remoteStacks });
+        this.plugin.debugLog({
+          event: "sync.pull.board-done",
+          boardId: localBoardId,
+          remoteId: remoteBoard.id,
+          stackCount: (remoteStacks || []).length,
+        });
       }
 
       this.plugin.data.nextcloud.boardBindings = bindings;
@@ -5221,8 +5244,21 @@ class SyncManager {
 
   async pushCreate(client, localBoard, list, card) {
     const payload = localCardToDeckCreate(card, { owner: this.plugin.data.nextcloud.username });
+    this.plugin.debugLog({
+      event: "sync.push.create.request",
+      cardId: card.id,
+      listRemoteId: list.remoteId,
+      descriptionLen: (payload.description || "").length,
+      hasChecklist: /(^|\n)#{1,6}\s*checklist/i.test(payload.description || ""),
+      // First 200 chars of the payload description so we can see the exact
+      // wire format going up to Deck. Debug-only, so users who don't enable
+      // logging never leak card content.
+      descriptionPreview: (payload.description || "").slice(0, 200),
+      checklistLen: (card.checklist || []).length,
+    });
     const { data: created } = await client.createCard(remoteBoard(localBoard), list.remoteId, payload);
     if (!created) throw new Error("Empty response from createCard");
+    this.plugin.debugLog({ event: "sync.push.create.done", cardId: card.id, remoteId: created.id });
     this.applyRemoteToCard(card, created, localBoard.id, list.id);
     card.localDirty = false;
     await this.attachments.pushCard(client, card, localBoard, list).catch((error) => {
@@ -5269,8 +5305,18 @@ class SyncManager {
 
     const payload = localCardToDeckPatch(card, { owner: this.plugin.data.nextcloud.username });
     const board = remoteBoard(localBoard);
+    this.plugin.debugLog({
+      event: "sync.push.update.request",
+      cardId: card.id,
+      remoteId: card.remoteId,
+      descriptionLen: (payload.description || "").length,
+      hasChecklist: /(^|\n)#{1,6}\s*checklist/i.test(payload.description || ""),
+      descriptionPreview: (payload.description || "").slice(0, 200),
+      checklistLen: (card.checklist || []).length,
+    });
     const { data: updated } = await client.updateCard(board, list.remoteId, card.remoteId, payload);
     if (!updated) throw new Error("Empty response from updateCard");
+    this.plugin.debugLog({ event: "sync.push.update.done", cardId: card.id, remoteId: card.remoteId });
     this.applyRemoteToCard(card, updated, localBoard.id, list.id);
     card.localDirty = false;
     await this.attachments.pushCard(client, card, localBoard, list).catch((error) => {
@@ -5714,6 +5760,25 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
     this.syncLog.push(Object.assign({ at: Date.now() }, event));
     // Cap the buffer so a chatty sync never balloons memory.
     if (this.syncLog.length > 200) this.syncLog.splice(0, this.syncLog.length - 200);
+  }
+
+  /**
+   * Emit a verbose diagnostic entry. Only records when settings.debugLogging
+   * is on; kept quiet by default so production sessions stay noise-free.
+   * Also mirrors to console.debug so users can grep the devtools console.
+   *
+   * `payload` may contain arbitrary keys; nothing sensitive should be logged
+   * (no App Password, no full card body). Keep it to identifiers, counts,
+   * status codes, and short error strings.
+   */
+  debugLog(payload) {
+    if (!this.data || !this.data.debugLogging) return;
+    const entry = Object.assign({ event: "debug" }, payload || {});
+    this.pushSyncLog(entry);
+    try {
+      // eslint-disable-next-line no-console
+      console.debug("[Nextcloud Deck debug]", entry);
+    } catch (_err) { /* console might be missing on mobile */ }
   }
 
   /**
@@ -7301,10 +7366,45 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
     ].join("\n");
 
     const file = this.app.vault.getAbstractFileByPath(card.filePath);
+    this.debugLog({
+      event: "writeCardFile",
+      cardId: card.id,
+      filePath: card.filePath,
+      hasCachedFile: !!file,
+      cachedIsMd: !!(file && file.extension === "md"),
+      title: card.title,
+      checklistLen: (card.checklist || []).length,
+    });
     if (file && file.extension === "md") {
       await this.app.vault.modify(file, markdown);
-    } else {
+      return;
+    }
+
+    // Fallback: the vault index may be stale (files re-created outside
+    // Obsidian, case-folded paths on macOS, or race conditions with sync
+    // reload). Ask the adapter directly before we create.
+    try {
+      const exists = await this.app.vault.adapter.exists(card.filePath);
+      this.debugLog({ event: "writeCardFile.adapter-exists", cardId: card.id, exists });
+      if (exists) {
+        // Read the raw file and overwrite; getAbstractFileByPath sometimes
+        // returns null for files that exist but haven't been indexed yet.
+        await this.app.vault.adapter.write(card.filePath, markdown);
+        return;
+      }
       await this.app.vault.create(card.filePath, markdown);
+    } catch (error) {
+      // Second-chance handler: if the error is "File already exists" we
+      // overwrite through the adapter. Any other error propagates so the
+      // save modal shows it to the user.
+      const message = (error && error.message) || String(error);
+      if (/already exists/i.test(message)) {
+        this.debugLog({ event: "writeCardFile.recover-existing", cardId: card.id, filePath: card.filePath, message });
+        await this.app.vault.adapter.write(card.filePath, markdown);
+        return;
+      }
+      this.debugLog({ event: "writeCardFile.failed", cardId: card.id, filePath: card.filePath, message });
+      throw error;
     }
   }
 };

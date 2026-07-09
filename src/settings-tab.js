@@ -82,6 +82,18 @@ class TaskDeckSettingTab extends PluginSettingTab {
       });
 
     new Setting(containerEl)
+      .setName("Debug logging")
+      .setDesc("Record verbose diagnostics (file paths, sync payloads, error stacks) to the sync log and the developer console. Leave off unless you're troubleshooting a bug.")
+      .addToggle((toggle) => {
+        toggle
+          .setValue(!!this.plugin.data.debugLogging)
+          .onChange(async (value) => {
+            this.plugin.data.debugLogging = !!value;
+            await this.plugin.savePluginData();
+          });
+      });
+
+    new Setting(containerEl)
       .setName("Version")
       .setDesc(this.plugin.manifest.version || "0.5.0");
   }
