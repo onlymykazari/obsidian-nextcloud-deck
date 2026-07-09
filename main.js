@@ -3935,7 +3935,13 @@ class DeckClient {
   uploadAttachment(boardId, stackId, cardId, { data, filename, mimeType }) {
     return this.multipartRequest({
       method: "POST",
-      path: `/boards/${encodeURIComponent(boardId)}/stacks/${encodeURIComponent(stackId)}/cards/${encodeURIComponent(cardId)}/attachment`,
+      // NOTE: the resource is spelled `attachments` (plural) in the REST API
+      // — see Deck docs "Upload an attachment". A singular URL falls through
+      // to a generic file-upload route on some deployments, storing the file
+      // in the user's Nextcloud Files without registering it on the card.
+      // Symptom: card's attachment panel stays empty but the raw file
+      // appears in the files tree.
+      path: `/boards/${encodeURIComponent(boardId)}/stacks/${encodeURIComponent(stackId)}/cards/${encodeURIComponent(cardId)}/attachments`,
       formFields: { type: "deck_file" },
       file: { field: "file", data, filename, mimeType: mimeType || "application/octet-stream" },
     });
@@ -3944,7 +3950,7 @@ class DeckClient {
   deleteAttachment(boardId, stackId, cardId, attachmentId) {
     return this.request({
       method: "DELETE",
-      path: `/boards/${encodeURIComponent(boardId)}/stacks/${encodeURIComponent(stackId)}/cards/${encodeURIComponent(cardId)}/attachment/${encodeURIComponent(attachmentId)}`,
+      path: `/boards/${encodeURIComponent(boardId)}/stacks/${encodeURIComponent(stackId)}/cards/${encodeURIComponent(cardId)}/attachments/${encodeURIComponent(attachmentId)}`,
     });
   }
 
@@ -5363,6 +5369,7 @@ class SyncManager {
       // wire format going up to Deck. Debug-only, so users who don't enable
       // logging never leak card content.
       descriptionPreview: (payload.description || "").slice(0, 200),
+      titlePreview: payload.title,
       checklistLen: (card.checklist || []).length,
     });
     const { data: created } = await client.createCard(remoteBoard(localBoard), list.remoteId, payload);
@@ -5446,6 +5453,7 @@ class SyncManager {
       descriptionLen: (payload.description || "").length,
       hasChecklist: /(^|\n)#{1,6}\s*checklist/i.test(payload.description || ""),
       descriptionPreview: (payload.description || "").slice(0, 200),
+      titlePreview: payload.title,
       checklistLen: (card.checklist || []).length,
       attachmentCount: (card.attachments || []).length,
     });

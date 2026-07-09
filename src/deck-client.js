@@ -210,7 +210,13 @@ class DeckClient {
   uploadAttachment(boardId, stackId, cardId, { data, filename, mimeType }) {
     return this.multipartRequest({
       method: "POST",
-      path: `/boards/${encodeURIComponent(boardId)}/stacks/${encodeURIComponent(stackId)}/cards/${encodeURIComponent(cardId)}/attachment`,
+      // NOTE: the resource is spelled `attachments` (plural) in the REST API
+      // — see Deck docs "Upload an attachment". A singular URL falls through
+      // to a generic file-upload route on some deployments, storing the file
+      // in the user's Nextcloud Files without registering it on the card.
+      // Symptom: card's attachment panel stays empty but the raw file
+      // appears in the files tree.
+      path: `/boards/${encodeURIComponent(boardId)}/stacks/${encodeURIComponent(stackId)}/cards/${encodeURIComponent(cardId)}/attachments`,
       formFields: { type: "deck_file" },
       file: { field: "file", data, filename, mimeType: mimeType || "application/octet-stream" },
     });
@@ -219,7 +225,7 @@ class DeckClient {
   deleteAttachment(boardId, stackId, cardId, attachmentId) {
     return this.request({
       method: "DELETE",
-      path: `/boards/${encodeURIComponent(boardId)}/stacks/${encodeURIComponent(stackId)}/cards/${encodeURIComponent(cardId)}/attachment/${encodeURIComponent(attachmentId)}`,
+      path: `/boards/${encodeURIComponent(boardId)}/stacks/${encodeURIComponent(stackId)}/cards/${encodeURIComponent(cardId)}/attachments/${encodeURIComponent(attachmentId)}`,
     });
   }
 

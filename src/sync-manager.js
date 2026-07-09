@@ -313,6 +313,7 @@ class SyncManager {
       // wire format going up to Deck. Debug-only, so users who don't enable
       // logging never leak card content.
       descriptionPreview: (payload.description || "").slice(0, 200),
+      titlePreview: payload.title,
       checklistLen: (card.checklist || []).length,
     });
     const { data: created } = await client.createCard(remoteBoard(localBoard), list.remoteId, payload);
@@ -396,6 +397,7 @@ class SyncManager {
       descriptionLen: (payload.description || "").length,
       hasChecklist: /(^|\n)#{1,6}\s*checklist/i.test(payload.description || ""),
       descriptionPreview: (payload.description || "").slice(0, 200),
+      titlePreview: payload.title,
       checklistLen: (card.checklist || []).length,
       attachmentCount: (card.attachments || []).length,
     });
