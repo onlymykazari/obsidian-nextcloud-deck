@@ -75,10 +75,9 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
         console.error("Task Deck: startup vault reconcile failed", error);
         new Notice("Task Deck loaded, but reconciling notes hit an error. Your boards are intact.");
       });
-      // Kick off Nextcloud pulls only after the vault has settled so any
-      // startup file work runs first (and any 30s local safety net doesn't
-      // fight a remote pull for the same data.json write lock).
-      this.scheduleNextcloudSync();
+      // Trigger a single initial pull on startup once the vault has settled.
+      // The recurring schedule (if enabled) is set up separately by
+      // reconfigureAutoSync at the end of onload — no more competing timers.
       if (this.isNextcloudEnabled()) {
         this.runNextcloudSync().catch(() => {});
       }
@@ -345,7 +344,6 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
     this.nextcloudAppPassword = appPassword;
     this.deckClient = null;
     await this.saveData(this.data);
-    this.scheduleNextcloudSync();
     // Now that we're connected, expose the ribbon icon and start the
     // auto-sync timer if the user has it enabled.
     this.updateNextcloudRibbon();
@@ -372,7 +370,6 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
     });
     this.nextcloudAppPassword = "";
     this.deckClient = null;
-    if (this.nextcloudPullTimer) { window.clearInterval(this.nextcloudPullTimer); this.nextcloudPullTimer = null; }
     await this.saveData(this.data);
     // Reflect the new "disconnected" state in the ribbon and stop the
     // periodic auto-sync so we don't keep hammering a defunct client.
@@ -556,16 +553,13 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
     }
   }
 
-  scheduleNextcloudSync() {
-    if (this.nextcloudPullTimer) window.clearInterval(this.nextcloudPullTimer);
-    const interval = Number((this.data.nextcloud || {}).syncIntervalMs || 0);
-    if (!interval) return; // manual only
-    this.nextcloudPullTimer = window.setInterval(() => {
-      if (!this.isNextcloudEnabled()) return;
-      this.runNextcloudSync().catch((error) => console.error("Nextcloud pull failed", error));
-    }, interval);
-    this.registerInterval(this.nextcloudPullTimer);
-  }
+  // Legacy `scheduleNextcloudSync` has been retired in favour of
+  // reconfigureAutoSync (top of this file). The old scheduler read
+  // `nc.syncIntervalMs` (hard-defaulting to 60_000ms) and ran even when the
+  // user hadn't opted into background sync, which meant we effectively had
+  // two overlapping timers doing the same thing after 0.5.0-pre.13 landed
+  // auto-sync. Now the user-visible "Automatic sync" toggle owns the
+  // schedule entirely.
 
   getBoard() {
     return this.findBoard(this.data.activeBoardId) || this.data.boards[0] || null;

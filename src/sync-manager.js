@@ -526,8 +526,16 @@ class SyncManager {
         await client.deleteCard(entry.boardRemoteId, entry.stackRemoteId, entry.remoteId);
         removed += 1;
       } catch (error) {
-        // 404 means it's already gone — accept that as success.
-        if (error instanceof DeckApiError && error.status === 404) {
+        // Treat these as "already gone" and drop from the queue:
+        //   404 — the card genuinely doesn't exist on the server anymore
+        //   403 — Deck's soft-delete state: the card was trashed (deletedAt
+        //         set), so DELETE returns Permission denied instead of 404.
+        //         Retrying will keep failing forever; leaving it in
+        //         pendingDeletions was what caused the "creeping duplicate"
+        //         observed in the field (see log complaint 2026-07-09).
+        //   410 — some Nextcloud deployments return Gone.
+        if (error instanceof DeckApiError && (error.status === 404 || error.status === 403 || error.status === 410)) {
+          this.plugin.debugLog({ event: "reap.treat-as-gone", entry, status: error.status });
           removed += 1;
         } else {
           this.plugin.pushSyncLog({ event: "reap-failed", entry, message: (error && error.message) || String(error) });

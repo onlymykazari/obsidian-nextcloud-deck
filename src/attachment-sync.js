@@ -207,7 +207,10 @@ class AttachmentSyncer {
         await client.deleteAttachment(entry.boardRemoteId, entry.stackRemoteId, entry.cardRemoteId, entry.attachmentRemoteId);
         removed += 1;
       } catch (error) {
-        if (error && error.status === 404) {
+        // See sync-manager.reapDeletions: 403/404/410 all mean "the server
+        // side is already in the terminal state we want" — retrying just
+        // wastes cycles and keeps the queue growing.
+        if (error && (error.status === 404 || error.status === 403 || error.status === 410)) {
           removed += 1;
           continue;
         }
