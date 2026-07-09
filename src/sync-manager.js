@@ -270,6 +270,21 @@ class SyncManager {
     await this.attachments.pushCard(client, card, localBoard, list).catch((error) => {
       this.plugin.pushSyncLog({ event: "attachment-push-failed", cardId: card.id, message: (error && error.message) || String(error) });
     });
+
+    // If the description contains wikilink embeds that now resolve to
+    // freshly-uploaded attachments, follow up with a description patch so
+    // Deck's renderer sees the CommonMark version. Skipped when there's no
+    // wikilink or no attachment metadata worth rewriting.
+    const rewritten = rewriteWikilinksForDeck(payload.description || "", card);
+    if (rewritten && rewritten !== payload.description) {
+      try {
+        const { data: updated } = await client.updateCard(remoteBoard(localBoard), list.remoteId, card.remoteId, Object.assign({}, payload, { description: rewritten }));
+        if (updated) this.applyRemoteToCard(card, updated, localBoard.id, list.id);
+        this.plugin.debugLog({ event: "sync.push.create.wikilink-rewrite", cardId: card.id });
+      } catch (error) {
+        this.plugin.pushSyncLog({ event: "wikilink-rewrite-failed", cardId: card.id, message: (error && error.message) || String(error) });
+      }
+    }
   }
 
   async pushUpdate(client, localBoard, list, card, remoteSnapshot, policy) {
@@ -309,7 +324,17 @@ class SyncManager {
       }
     }
 
+    // Upload attachments FIRST so we can rewrite Obsidian wikilinks in the
+    // description into `/apps/deck/cards/<id>/attachment/<attId>` URLs that
+    // Deck's Markdown renderer can actually display. If attachments arrived
+    // after the description update, the first push would ship the raw
+    // `![[…]]` and Deck would spin forever on a broken image tile.
+    await this.attachments.pushCard(client, card, localBoard, list).catch((error) => {
+      this.plugin.pushSyncLog({ event: "attachment-push-failed", cardId: card.id, message: (error && error.message) || String(error) });
+    });
+
     const payload = localCardToDeckPatch(card, { owner: this.plugin.data.nextcloud.username });
+    payload.description = rewriteWikilinksForDeck(payload.description, card);
     const board = remoteBoard(localBoard);
     this.plugin.debugLog({
       event: "sync.push.update.request",
@@ -319,15 +344,13 @@ class SyncManager {
       hasChecklist: /(^|\n)#{1,6}\s*checklist/i.test(payload.description || ""),
       descriptionPreview: (payload.description || "").slice(0, 200),
       checklistLen: (card.checklist || []).length,
+      attachmentCount: (card.attachments || []).length,
     });
     const { data: updated } = await client.updateCard(board, list.remoteId, card.remoteId, payload);
     if (!updated) throw new Error("Empty response from updateCard");
     this.plugin.debugLog({ event: "sync.push.update.done", cardId: card.id, remoteId: card.remoteId });
     this.applyRemoteToCard(card, updated, localBoard.id, list.id);
     card.localDirty = false;
-    await this.attachments.pushCard(client, card, localBoard, list).catch((error) => {
-      this.plugin.pushSyncLog({ event: "attachment-push-failed", cardId: card.id, message: (error && error.message) || String(error) });
-    });
     return "pushed";
   }
 
@@ -417,6 +440,53 @@ function buildRemoteCardIndex(remoteStacks) {
     });
   });
   return index;
+}
+
+/**
+ * Deck's Markdown renderer is plain CommonMark — it does not understand
+ * Obsidian wikilinks like `![[foo/bar.png]]`. Left as-is, users see a
+ * perpetually loading tile inside the card description on Deck.
+ *
+ * We rewrite each embed to a real Markdown image link that Deck can resolve
+ * via its own attachment API:
+ *
+ *     ![filename](/index.php/apps/deck/cards/{cardRemoteId}/attachment/{attId})
+ *
+ * The attachment id is looked up by matching the filename inside the
+ * embed to `card.attachments[].filename` (populated on push after upload).
+ * Embeds we can't resolve (unsynced files, references to notes) become a
+ * plain `[filename](wikilink)` so at least the file name stays visible on
+ * Deck instead of a broken `![[...]]` blob.
+ */
+function rewriteWikilinksForDeck(description, card) {
+  if (typeof description !== "string" || !description) return description;
+  if (!card || card.remoteId == null) return description;
+  const attachmentsByName = new Map();
+  (Array.isArray(card.attachments) ? card.attachments : []).forEach((att) => {
+    if (att && att.filename && att.remoteId != null) {
+      attachmentsByName.set(String(att.filename).toLowerCase(), att);
+    }
+  });
+
+  // Match both embed and link forms: ![[…]] and [[…]].
+  const wikilinkRe = /(!?)\[\[([^\]]+)\]\]/g;
+  return description.replace(wikilinkRe, (match, bang, inner) => {
+    const parts = String(inner).split("|");
+    const target = parts[0].trim();
+    const alias = (parts[1] || "").trim();
+    const base = target.split("/").pop();
+    const att = base ? attachmentsByName.get(base.toLowerCase()) : null;
+    if (att) {
+      const url = `/index.php/apps/deck/cards/${card.remoteId}/attachment/${att.remoteId}`;
+      const caption = alias || base;
+      return `${bang}[${caption}](${url})`;
+    }
+    // No resolvable attachment — fall back to a plain text link so Deck
+    // renders something meaningful instead of leaving raw `![[…]]` on
+    // screen.
+    const caption = alias || base || target;
+    return bang ? `![${caption}](${target})` : `[${caption}](${target})`;
+  });
 }
 
 module.exports = {
