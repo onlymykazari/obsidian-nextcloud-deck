@@ -77,14 +77,24 @@ class SyncLogModal extends Modal {
         lastSyncAt: nc.lastSyncAt ? new Date(nc.lastSyncAt).toISOString() : "never",
       },
       status: (this.plugin.syncManager && this.plugin.syncManager.getStatus()) || null,
-      events: events.map((event) => ({
-        at: event.at ? new Date(event.at).toISOString() : null,
-        event: event.event,
-        message: event.message || null,
-        cardId: event.cardId || null,
-        boardId: event.boardId || null,
-        stackId: event.stackId || null,
-      })),
+      events: events.map((event) => {
+        // Keep every field except a small blacklist so diagnostics stay
+        // useful for triage. The plugin never puts App Password or full
+        // card bodies into event payloads, so the copy is already safe;
+        // we just strip anything we know we don't want on the clipboard.
+        const BLACKLIST = new Set([
+          "appPassword",
+          "password",
+          "authorization",
+        ]);
+        const safe = { at: event.at ? new Date(event.at).toISOString() : null };
+        Object.keys(event).forEach((k) => {
+          if (k === "at") return;
+          if (BLACKLIST.has(k)) return;
+          safe[k] = event[k];
+        });
+        return safe;
+      }),
     };
 
     const text = JSON.stringify(summary, null, 2);

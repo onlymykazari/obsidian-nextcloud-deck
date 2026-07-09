@@ -145,7 +145,48 @@ class SyncManager {
   async pullCards(client, remoteBoardId, localBoard, remoteStacks) {
     const cardMap = new Map();
     Object.values(this.plugin.data.cards).forEach((card) => {
-      if (card.boardId === localBoard.id && card.remoteId != null) cardMap.set(card.remoteId, card);
+      // Coerce to Number so a remoteId stored as string still matches a
+      // number coming back from Deck (belt-and-suspenders; the API returns
+      // numeric ids, but we've seen serialization gymnastics elsewhere).
+      if (card.boardId === localBoard.id && card.remoteId != null) cardMap.set(Number(card.remoteId), card);
+    });
+
+    // Detect duplicates that have already sneaked into data.cards — same
+    // remoteId owned by two local cards. This causes the "creeping
+    // duplicates" pattern where every pull creates yet another entry. We
+    // consolidate down to the first one seen and drop the extras from
+    // data.cards outright.
+    const duplicates = new Map(); // remoteId -> [cards]
+    Object.values(this.plugin.data.cards).forEach((card) => {
+      if (card.boardId !== localBoard.id || card.remoteId == null) return;
+      const key = Number(card.remoteId);
+      if (!duplicates.has(key)) duplicates.set(key, []);
+      duplicates.get(key).push(card);
+    });
+    let dedupedLocal = 0;
+    duplicates.forEach((cards, remoteId) => {
+      if (cards.length < 2) return;
+      // Keep the first one, drop the rest.
+      cards.slice(1).forEach((extra) => {
+        delete this.plugin.data.cards[extra.id];
+        dedupedLocal += 1;
+      });
+      this.plugin.pushSyncLog({
+        event: "pull.dedupe-local",
+        boardId: localBoard.id,
+        remoteId,
+        kept: cards[0].id,
+        droppedIds: cards.slice(1).map((c) => c.id),
+      });
+    });
+
+    this.plugin.debugLog({
+      event: "sync.pull.cards.start",
+      boardId: localBoard.id,
+      remoteBoardId,
+      localTracked: cardMap.size,
+      dedupedLocal,
+      totalDataCards: Object.keys(this.plugin.data.cards).length,
     });
 
     // Track which lists were rebuilt so we can preserve the ordering of any
@@ -163,15 +204,27 @@ class SyncManager {
 
       const sorted = cards.slice().sort((a, b) => (a.order || 0) - (b.order || 0));
       for (const remoteCard of sorted) {
-        const existing = cardMap.get(remoteCard.id);
+        const remoteIdKey = Number(remoteCard.id);
+        const existing = cardMap.get(remoteIdKey);
         const merged = mergeRemoteCardOntoLocal(existing, remoteCard, { boardId: localBoard.id, listId: localList.id });
         const cardId = existing ? existing.id : merged.id;
         merged.id = cardId;
         merged.boardId = localBoard.id;
         merged.listId = localList.id;
+        // Preserve filePath from existing local card if we had one, so a
+        // subsequent writeCardFile updates the same note instead of
+        // generating a fresh path each pull.
+        if (existing && existing.filePath) merged.filePath = existing.filePath;
         this.plugin.data.cards[cardId] = merged;
         localList.cardIds.push(cardId);
-        cardMap.delete(remoteCard.id);
+        cardMap.delete(remoteIdKey);
+        this.plugin.debugLog({
+          event: "sync.pull.card",
+          cardId,
+          remoteId: remoteIdKey,
+          matched: !!existing,
+          title: merged.title,
+        });
 
         // Fetch attachments for the card (only if feature-enabled).
         try {
@@ -443,32 +496,36 @@ function buildRemoteCardIndex(remoteStacks) {
 }
 
 /**
- * Deck's Markdown renderer is plain CommonMark — it does not understand
- * Obsidian wikilinks like `![[foo/bar.png]]`. Left as-is, users see a
- * perpetually loading tile inside the card description on Deck.
+ * Strip Obsidian wikilink embeds from a description before it goes to Deck.
  *
- * We rewrite each embed to a real Markdown image link that Deck can resolve
- * via its own attachment API:
+ * Rationale (see Deck REST docs, "Attachments" section): Deck's attachments
+ * are a first-class module attached to the card, not embedded through
+ * description Markdown. Deck's Web UI renders attachments in a dedicated
+ * area below the description; it does NOT re-render `![[...]]` (unknown
+ * syntax) nor `![](/index.php/apps/deck/cards/.../attachment/...)` (the
+ * server refuses same-origin embed with CSP for security).
  *
- *     ![filename](/index.php/apps/deck/cards/{cardRemoteId}/attachment/{attId})
+ * So on push we just remove the wikilink embed lines that point to a file
+ * we've already uploaded via the attachments API — the user still sees the
+ * image in Deck's attachments panel. For wikilinks we cannot resolve
+ * (references to notes, unsynced files) we replace the embed with a plain
+ * `[caption]` label so Deck at least renders readable text instead of the
+ * raw double-bracket blob.
  *
- * The attachment id is looked up by matching the filename inside the
- * embed to `card.attachments[].filename` (populated on push after upload).
- * Embeds we can't resolve (unsynced files, references to notes) become a
- * plain `[filename](wikilink)` so at least the file name stays visible on
- * Deck instead of a broken `![[...]]` blob.
+ * On pull we restore the wikilink form so Obsidian keeps rendering the
+ * inline embed (attachments are downloaded into the vault by
+ * AttachmentSyncer).
  */
 function rewriteWikilinksForDeck(description, card) {
   if (typeof description !== "string" || !description) return description;
-  if (!card || card.remoteId == null) return description;
+  if (!card) return description;
   const attachmentsByName = new Map();
   (Array.isArray(card.attachments) ? card.attachments : []).forEach((att) => {
-    if (att && att.filename && att.remoteId != null) {
+    if (att && att.filename) {
       attachmentsByName.set(String(att.filename).toLowerCase(), att);
     }
   });
 
-  // Match both embed and link forms: ![[…]] and [[…]].
   const wikilinkRe = /(!?)\[\[([^\]]+)\]\]/g;
   return description.replace(wikilinkRe, (match, bang, inner) => {
     const parts = String(inner).split("|");
@@ -477,15 +534,13 @@ function rewriteWikilinksForDeck(description, card) {
     const base = target.split("/").pop();
     const att = base ? attachmentsByName.get(base.toLowerCase()) : null;
     if (att) {
-      const url = `/index.php/apps/deck/cards/${card.remoteId}/attachment/${att.remoteId}`;
-      const caption = alias || base;
-      return `${bang}[${caption}](${url})`;
+      // Drop the embed entirely. The file lives on the card's attachment
+      // panel — no need to duplicate it in the description body.
+      return "";
     }
-    // No resolvable attachment — fall back to a plain text link so Deck
-    // renders something meaningful instead of leaving raw `![[…]]` on
-    // screen.
+    // Unresolvable — keep something readable instead of the raw brackets.
     const caption = alias || base || target;
-    return bang ? `![${caption}](${target})` : `[${caption}](${target})`;
+    return caption;
   });
 }
 
