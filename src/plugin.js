@@ -156,7 +156,11 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
       window.clearInterval(this.autoSyncTimer);
       this.autoSyncTimer = null;
     }
-    this.app.workspace.detachLeavesOfType(VIEW_TYPE);
+    // Do NOT detach the plugin's leaves on unload. Obsidian's policy is that
+    // the workspace should survive plugin reloads (BRAT / dev refresh),
+    // and detachLeavesOfType would silently close every open board tab
+    // during a hot reload. Registered views are torn down by the base
+    // Plugin class automatically.
   }
 
   /**

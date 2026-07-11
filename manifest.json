@@ -1,9 +1,10 @@
 {
   "id": "obsidian-nextcloud-deck",
   "name": "NextDeck",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "minAppVersion": "1.5.0",
-  "description": "Kanban boards for Obsidian with Markdown-backed cards, labels, dates, checklists, and optional Nextcloud Deck sync.",
-  "author": "Obsidian Nextcloud Deck contributors",
+  "description": "Markdown-backed kanban boards with two-way Nextcloud Deck sync.",
+  "author": "onlymykazari",
+  "authorUrl": "https://github.com/onlymykazari",
   "isDesktopOnly": false
 }
