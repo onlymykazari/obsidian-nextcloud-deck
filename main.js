@@ -2533,21 +2533,18 @@ class CardModal extends Modal {
     }
 
     const actions = createElement("div", "ot-attachment-actions");
-    const copyUrlBtn = iconButton("link", "Copy Obsidian URL", async () => {
+    const copyUrlBtn = iconButton("link", "Copy vault embed link (![[...]])", async () => {
       if (!attachment.filePath) {
         new Notice("Attachment has no vault path yet.");
         return;
       }
-      const vaultName = (this.app.vault && typeof this.app.vault.getName === "function")
-        ? this.app.vault.getName()
-        : "";
-      const url = `obsidian://open?vault=${encodeURIComponent(vaultName)}&file=${encodeURIComponent(attachment.filePath)}`;
+      const embed = `![[${attachment.filePath}]]`;
       try {
         if (navigator && navigator.clipboard && navigator.clipboard.writeText) {
-          await navigator.clipboard.writeText(url);
+          await navigator.clipboard.writeText(embed);
         } else {
           const holder = document.createElement("textarea");
-          holder.value = url;
+          holder.value = embed;
           holder.setAttribute("readonly", "");
           holder.style.position = "absolute";
           holder.style.left = "-9999px";
@@ -2556,7 +2553,7 @@ class CardModal extends Modal {
           document.execCommand("copy");
           document.body.removeChild(holder);
         }
-        new Notice("Obsidian URL copied to clipboard.");
+        new Notice("Embed link copied to clipboard.");
       } catch (error) {
         new Notice(`Copy failed: ${(error && error.message) || error}`);
       }
