@@ -828,7 +828,7 @@
 
 /* Roomier card modal (closer to Trello) so description + images + checklist
    have space; the content area scrolls. */
-.modal:has(.ot-card-modal) {
+.modal.ot-card-modal-root {
   width: min(880px, 94vw);
   max-width: 94vw;
 }
@@ -842,10 +842,10 @@
   color: var(--text-muted);
 }
 
-.modal:has(.ot-card-modal) .modal-close-button,
-.modal:has(.ot-about-modal) .modal-close-button,
-.modal:has(.ot-date-modal) .modal-close-button,
-.modal:has(.ot-label-modal) .modal-close-button {
+.modal.ot-card-modal-root .modal-close-button,
+.modal.ot-about-modal-root .modal-close-button,
+.modal.ot-date-modal-root .modal-close-button,
+.modal.ot-label-modal-root .modal-close-button {
   top: 12px;
   right: 12px;
   z-index: 2;
@@ -2049,7 +2049,7 @@
   color: var(--text-normal);
 }
 /* Make the setting-item positioned so absolute caption anchors here. */
-.setting-item:has(.ot-settings-support-caption) {
+.setting-item.ot-settings-support-item {
   position: relative;
   padding-bottom: 22px;
 }

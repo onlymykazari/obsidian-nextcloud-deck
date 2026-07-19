@@ -1255,6 +1255,7 @@ class LabelPickerModal extends Modal {
   }
 
   render() {
+    this.modalEl.addClass("ot-label-modal-root");
     this.contentEl.replaceChildren();
     this.contentEl.addClass("ot-label-modal");
 
@@ -1508,6 +1509,7 @@ class CardDatesModal extends Modal {
   }
 
   render() {
+    this.modalEl.addClass("ot-date-modal-root");
     this.contentEl.replaceChildren();
     this.contentEl.addClass("ot-date-modal");
     this.contentEl.append(createElement("h2", "", "Dates"));
@@ -1660,6 +1662,7 @@ class AboutModal extends Modal {
   }
 
   onOpen() {
+    this.modalEl.addClass("ot-about-modal-root");
     this.contentEl.replaceChildren();
     this.contentEl.addClass("ot-about-modal");
     this.contentEl.append(
@@ -1777,6 +1780,7 @@ class CardModal extends Modal {
 
   render() {
     const card = this.card;
+    this.modalEl.addClass("ot-card-modal-root");
     this.contentEl.replaceChildren();
     this.contentEl.addClass("ot-card-modal");
 
@@ -4209,6 +4213,7 @@ class TaskDeckSettingTab extends PluginSettingTab {
             window.open("https://buymeacoffee.com/onlymykazari", "_blank");
           });
       });
+    supportSetting.settingEl.addClass("ot-settings-support-item");
 
     // Small caption anchored under the setting row. Rendered as a link so
     // Obsidian styles it consistently; opening in a new tab so the user

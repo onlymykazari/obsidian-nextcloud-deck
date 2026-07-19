@@ -421,6 +421,7 @@ class TaskDeckSettingTab extends PluginSettingTab {
             window.open("https://buymeacoffee.com/onlymykazari", "_blank");
           });
       });
+    supportSetting.settingEl.addClass("ot-settings-support-item");
 
     // Small caption anchored under the setting row. Rendered as a link so
     // Obsidian styles it consistently; opening in a new tab so the user
