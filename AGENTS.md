@@ -31,6 +31,27 @@ node scripts/mock-nextcloud.js
 
 No `npm install`, no `package.json`. The bundler in `build.js` is a hand-rolled ~70-line CommonJS collector — read it before "improving" it.
 
+### 2.1 Agent-only: capturing command output reliably
+
+Trae 的 `RunCommand` 回传的 `command_run_logs` 是**终端 PTY 可视区截图**（大约几行 × 80 列），而不是完整 stdout。启动时 Trae 还会在终端顶部注入一条 `export PATH=…@vscode/ripgrep/bin` 占掉两行，因此**短输出容易被挤掉、长输出会被滚走**。凡遇到下列情况，agent 必须把输出重定向到临时文件再用 `Read` 读取，**不要**依赖 `command_run_logs` 或 `CheckCommandStatus`：
+
+- 命令预计输出超过 ~5 行（例如 `node scripts/test-sync-units.js` 全量跑、`node scripts/mock-nextcloud.js`、`gh release view`、`git log`、`git diff` 非 `--stat`）。
+- 命令包含进度条 / spinner / 颜色码（`npm *`、`gh release create` 上传阶段、`git clone`）——即使本仓库不用 npm，别的项目里遇到时同样适用。
+- 需要精确核对输出内容（测试断言、diff 校验、版本号比对）。
+
+推荐写法：
+
+```bash
+node scripts/test-sync-units.js > /tmp/nextdeck-test.log 2>&1; echo EXIT=$?
+```
+
+然后 `Read /tmp/nextdeck-test.log`。只关心成败时看 `EXIT=` 一行即可。
+
+**不需要**这么做的场景（避免过度工程化）：
+- 单行输出命令：`node --check main.js`、`git rev-parse HEAD`、`cat manifest.json | jq .version` 等。
+- 只用退出码做判断的命令：直接 `cmd && next-cmd` 链式即可。
+- 需要用户实时看到进度的 dev server（本仓库没有此类）。
+
 ## 3. Release flow
 
 Every user-facing change ships as a GitHub release. **This is the ONLY distribution channel** — Obsidian's Community Plugins updater pulls from GitHub releases directly.

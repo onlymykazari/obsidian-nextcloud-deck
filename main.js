@@ -5676,18 +5676,47 @@ class SyncManager {
 
       for (const remoteBoard of remoteBoards) {
         const localBoardId = this.findOrBindLocalBoard(remoteBoard, bindings, boardMap);
-        boundLocalIds.add(localBoardId);
-        const remoteStacks = await this.pullBoard(client, remoteBoard, localBoardId);
-        boardContext.set(localBoardId, { remoteBoard, remoteStacks });
-        this.plugin.debugLog({
-          event: "sync.pull.board-done",
-          boardId: localBoardId,
-          remoteId: remoteBoard.id,
-          stackCount: (remoteStacks || []).length,
-        });
+        try {
+          const remoteStacks = await this.pullBoard(client, remoteBoard, localBoardId);
+          // Only mark the board as successfully pulled AFTER pullBoard
+          // returns. A failure below (e.g. 403 on getStacks because the
+          // user's permission was revoked on Deck web UI) used to bubble
+          // out of syncOnce and abort the whole tick — which meant the
+          // board index rewrite loop at the end never ran, so every OTHER
+          // board's freshly rebuilt lists never made it to their index.md.
+          // Pitfall #1 (shadow lists) then reproduced on the next
+          // vault-modify → queueCardFolderSync cycle. Isolating per-board
+          // failures keeps the rest of the sync healthy.
+          boundLocalIds.add(localBoardId);
+          boardContext.set(localBoardId, { remoteBoard, remoteStacks });
+          this.plugin.debugLog({
+            event: "sync.pull.board-done",
+            boardId: localBoardId,
+            remoteId: remoteBoard.id,
+            stackCount: (remoteStacks || []).length,
+          });
+        } catch (error) {
+          const status = error instanceof DeckApiError ? error.status : null;
+          this.plugin.pushSyncLog({
+            event: "sync.pull.board-failed",
+            boardId: localBoardId,
+            remoteId: remoteBoard.id,
+            status,
+            message: (error && error.message) || String(error),
+          });
+        }
       }
 
       this.plugin.data.nextcloud.boardBindings = bindings;
+
+      // Reap boards that vanished from Deck's /boards listing. Distinct
+      // from the per-board failure branch above: a 403/404 on a specific
+      // board keeps its binding intact (permission may be restored later,
+      // and the board still appears in /boards). We only reap when the
+      // remote is authoritatively silent — i.e. /boards succeeded but no
+      // longer returns this remoteId. Vault folders are moved to the
+      // system trash so the user can recover if this fires unexpectedly.
+      await this.reapRemovedBoards(remoteBoards, bindings);
 
       // Prune stale duplicate boards. Root cause: an older/buggy code
       // path (or a partial restore from vault index files) can leave
@@ -5798,6 +5827,104 @@ class SyncManager {
     this.mergeBoardLabelsIntoGlobal(reconciled);
     await this.pullCards(client, hydrated.id, reconciled, stacks || []);
     return stacks || [];
+  }
+
+  /**
+   * Drop local boards whose remote counterpart has been deleted on the
+   * Deck web UI. We treat "authoritatively gone" as: /boards returned
+   * successfully AND does NOT include this board's remoteId. A per-board
+   * fetch failure (403/404) is NOT enough — Deck sometimes returns 403
+   * for archived-but-visible boards or when permissions are being
+   * reshuffled, and we don't want to nuke local data over a transient
+   * permission blip.
+   *
+   * Cleanup covers: data.boards entry, all cards belonging to that board,
+   * the corresponding boardBindings key, and pendingDeletions still
+   * queued against the now-gone board. Vault folders are moved to the
+   * system trash (`app.vault.trash(folder, true)`) so remote deletion
+   * really means the local Markdown files also disappear — matching the
+   * user's expectation that remote is authoritative. `trash` uses the OS
+   * trash rather than a hard delete, so accidental reaps stay
+   * recoverable outside Obsidian.
+   */
+  async reapRemovedBoards(remoteBoards, bindings) {
+    if (!Array.isArray(remoteBoards)) return;
+    const liveRemoteIds = new Set(remoteBoards.map((b) => Number(b.id)).filter((n) => !Number.isNaN(n)));
+    const droppedBoards = [];
+    const survivors = [];
+    for (const board of this.plugin.data.boards) {
+      if (board.remoteId == null) { survivors.push(board); continue; }
+      if (liveRemoteIds.has(Number(board.remoteId))) { survivors.push(board); continue; }
+      // Board was bound to a remote that /boards no longer returns —
+      // treat as authoritative delete.
+      droppedBoards.push(board);
+    }
+    if (!droppedBoards.length) return;
+
+    const dropSet = new Set(droppedBoards.map((b) => b.id));
+    this.plugin.data.boards = survivors;
+
+    // Drop cards owned by any reaped board.
+    let droppedCards = 0;
+    for (const cardId of Object.keys(this.plugin.data.cards)) {
+      const card = this.plugin.data.cards[cardId];
+      if (card && dropSet.has(card.boardId)) {
+        delete this.plugin.data.cards[cardId];
+        droppedCards += 1;
+      }
+    }
+
+    // Drop bindings pointing at the reaped boards.
+    for (const key of Object.keys(bindings)) {
+      if (dropSet.has(key)) delete bindings[key];
+    }
+
+    // Any pendingDeletions still queued against a now-gone board would
+    // 404 forever — clear them.
+    const nc = this.plugin.data.nextcloud;
+    if (Array.isArray(nc.pendingDeletions)) {
+      const liveRemoteBoardIds = new Set(survivors.map((b) => Number(b.remoteId)).filter((n) => !Number.isNaN(n)));
+      nc.pendingDeletions = nc.pendingDeletions.filter((entry) => liveRemoteBoardIds.has(Number(entry.boardRemoteId)));
+    }
+
+    if (this.plugin.data.activeBoardId && dropSet.has(this.plugin.data.activeBoardId)) {
+      this.plugin.data.activeBoardId = (survivors[0] && survivors[0].id) || "";
+    }
+
+    // Move the vault folder for each dropped board to the OS trash. We
+    // do this inside `reconciling` so the trash operation's vault-delete
+    // event doesn't kick queueCardFolderSync back into rebuilding what
+    // we just removed. Best-effort — a folder that's already gone (user
+    // deleted it, or plugin never got to write one) is a no-op.
+    const trashedFolders = [];
+    this.plugin.reconciling = true;
+    try {
+      for (const board of droppedBoards) {
+        const folderPath = board && board.folderPath;
+        if (!folderPath) continue;
+        const folder = this.plugin.app.vault.getAbstractFileByPath(folderPath);
+        if (!folder) continue;
+        try {
+          await this.plugin.app.vault.trash(folder, true);
+          trashedFolders.push(folderPath);
+        } catch (error) {
+          this.plugin.pushSyncLog({
+            event: "sync.reap-board-trash-failed",
+            folderPath,
+            message: (error && error.message) || String(error),
+          });
+        }
+      }
+    } finally {
+      this.plugin.reconciling = false;
+    }
+
+    this.plugin.pushSyncLog({
+      event: "sync.reap-removed-boards",
+      droppedBoardIds: droppedBoards.map((b) => b.id),
+      droppedCards,
+      trashedFolders,
+    });
   }
 
   /**
