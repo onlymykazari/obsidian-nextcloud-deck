@@ -4388,6 +4388,20 @@ class DeckClient {
     return this.request({ method: "GET", path: `/boards/${encodeURIComponent(boardId)}/stacks`, etag });
   }
 
+  /**
+   * Fetch a single stack with its embedded cards. Used as a fallback when
+   * the bulk `/stacks` response omits the `cards` array on some Deck
+   * deployments. Not all Deck versions expose this endpoint; callers should
+   * handle 404 gracefully.
+   */
+  getStack(boardId, stackId, { etag } = {}) {
+    return this.request({
+      method: "GET",
+      path: `/boards/${encodeURIComponent(boardId)}/stacks/${encodeURIComponent(stackId)}`,
+      etag,
+    });
+  }
+
   createStack(boardId, { title, order }) {
     const body = { title };
     if (order !== undefined) body.order = order;
@@ -5024,8 +5038,12 @@ function applyPolicy(policy, conflicts, { localUpdatedAt, remoteUpdatedAt } = {}
  * we can conflict-merge are captured; labels and assignees are recorded as a
  * shallow signature so we can still detect that they moved (without having to
  * store the whole array in data.json).
+ *
+ * `stackRemoteId` is optional — the sync manager sets it after pull/push so
+ * that the next push can detect local card moves across stacks (Deck requires
+ * a separate `reorderCard` call for that, not covered by the PUT endpoint).
  */
-function snapshotBaseline(card) {
+function snapshotBaseline(card, { stackRemoteId } = {}) {
   if (!card) return null;
   return {
     title: card.title || "",
@@ -5034,6 +5052,7 @@ function snapshotBaseline(card) {
     dueDate: card.dueDate || "",
     startDate: card.startDate || "",
     labelsSignature: signatureOfLabels(card.labels),
+    stackRemoteId: stackRemoteId != null ? Number(stackRemoteId) : null,
   };
 }
 
@@ -5130,7 +5149,7 @@ function mergeDetailsAndChecklist(details, checklist) {
  * preserved as-is (uid + display name) so future team support can round-trip
  * cleanly, but the MVP UI won't render them.
  */
-function remoteCardToLocal(remoteCard, { boardId, listId }) {
+function remoteCardToLocal(remoteCard, { boardId, listId, stackRemoteId } = {}) {
   if (!remoteCard) return null;
   const labels = Array.isArray(remoteCard.labels)
     ? remoteCard.labels.map((label) => ({
@@ -5184,7 +5203,7 @@ function remoteCardToLocal(remoteCard, { boardId, listId }) {
   const split = splitDescriptionWithChecklist(card.details);
   card.details = split.details;
   card.checklist = split.checklist;
-  card.baseline = snapshotBaseline(card);
+  card.baseline = snapshotBaseline(card, { stackRemoteId });
   return card;
 }
 
@@ -5193,8 +5212,8 @@ function remoteCardToLocal(remoteCard, { boardId, listId }) {
  * user hasn't touched locally (`localDirty === false`) are overwritten; the
  * local id and file path are preserved so vault notes don't churn.
  */
-function mergeRemoteCardOntoLocal(existing, remoteCard, { boardId, listId }) {
-  const remote = remoteCardToLocal(remoteCard, { boardId, listId });
+function mergeRemoteCardOntoLocal(existing, remoteCard, { boardId, listId, stackRemoteId } = {}) {
+  const remote = remoteCardToLocal(remoteCard, { boardId, listId, stackRemoteId });
   if (!existing) return remote;
 
   const merged = { ...existing };
@@ -5633,6 +5652,50 @@ class SyncManager {
     this.attachments = new AttachmentSyncer(plugin);
   }
 
+  // ---- ETag cache helpers (P2-1) -------------------------------------------
+  //
+  // Cache server ETags in `data.nextcloud.etags` so repeated syncs can skip
+  // unchanged boards/stacks via If-None-Match → 304. The cache is invalidated
+  // after any push to a board so the next pull always sees fresh data.
+
+  _ensureEtags() {
+    const nc = this.plugin.data.nextcloud;
+    if (!nc.etags || typeof nc.etags !== "object") nc.etags = {};
+    return nc.etags;
+  }
+
+  _getCachedEtag(key) {
+    const etags = this.plugin.data.nextcloud && this.plugin.data.nextcloud.etags;
+    return (etags && etags[key]) || undefined;
+  }
+
+  _setCachedEtag(key, value) {
+    if (!value) return;
+    this._ensureEtags()[key] = value;
+  }
+
+  _invalidateBoardEtags(boardRemoteId) {
+    const nc = this.plugin.data.nextcloud;
+    if (!nc) return;
+    const etags = nc.etags;
+    if (etags) {
+      // Clear board-level and all per-stack etags for this board.
+      delete etags[`board:${boardRemoteId}`];
+      delete etags[`stacks:${boardRemoteId}`];
+      const prefix = `stack:${boardRemoteId}:`;
+      for (const key of Object.keys(etags)) {
+        if (key.startsWith(prefix)) delete etags[key];
+      }
+    }
+    // Also clear cached response data for this board.
+    delete nc[`_cachedBoard:${boardRemoteId}`];
+    delete nc[`_cachedStacks:${boardRemoteId}`];
+    const stackPrefix = `_cachedStackCards:${boardRemoteId}:`;
+    for (const key of Object.keys(nc)) {
+      if (key.startsWith(stackPrefix)) delete nc[key];
+    }
+  }
+
   getStatus() { return this.status; }
 
   async runPull({ manual = false } = {}) {
@@ -5655,7 +5718,19 @@ class SyncManager {
 
     try {
       // ---- Phase 1: Pull ----------------------------------------------------
-      const { data: remoteBoards } = await client.getBoards();
+      // ETag: pass cached etag so the server can 304 if nothing changed.
+      // On 304, fall back to the cached boards list from last successful pull.
+      const boardsEtag = this._getCachedEtag("boards");
+      const boardsResp = await client.getBoards({ etag: boardsEtag });
+      let remoteBoards;
+      if (boardsResp.status === 304) {
+        remoteBoards = (this.plugin.data.nextcloud._cachedBoards || []);
+        this.plugin.debugLog({ event: "sync.pull.boards.304", cached: remoteBoards.length });
+      } else {
+        remoteBoards = boardsResp.data;
+        this._setCachedEtag("boards", boardsResp.etag);
+        this.plugin.data.nextcloud._cachedBoards = Array.isArray(remoteBoards) ? remoteBoards : [];
+      }
       if (!Array.isArray(remoteBoards)) throw new Error("Unexpected boards response.");
       this.plugin.debugLog({
         event: "sync.pull.boards",
@@ -5803,30 +5878,61 @@ class SyncManager {
     // with a duplicate-title 400.
     let hydrated = remoteBoard;
     try {
-      const { data: full } = await client.getBoard(remoteBoard.id);
-      if (full) hydrated = full;
+      const boardEtag = this._getCachedEtag(`board:${remoteBoard.id}`);
+      const resp = await client.getBoard(remoteBoard.id, { etag: boardEtag });
+      if (resp.status === 304) {
+        // Board unchanged since last pull — use cached hydrated copy if available.
+        const cached = this.plugin.data.nextcloud[`_cachedBoard:${remoteBoard.id}`];
+        if (cached) hydrated = cached;
+        this.plugin.debugLog({ event: "sync.pull.board.304", boardId: remoteBoard.id });
+      } else {
+        if (resp.data) hydrated = resp.data;
+        this._setCachedEtag(`board:${remoteBoard.id}`, resp.etag);
+        this.plugin.data.nextcloud[`_cachedBoard:${remoteBoard.id}`] = hydrated;
+      }
     } catch (error) {
       this.plugin.pushSyncLog({ event: "board-hydrate-failed", boardId: remoteBoard.id, message: (error && error.message) || String(error) });
     }
+    // Wrap getStacks in its own try/catch so a 403 (permission revoked,
+    // archived board, etc.) doesn't propagate out of pullBoard and abort
+    // the entire sync tick. On failure we fall back to empty stacks —
+    // the board still gets its binding recorded and the next tick can
+    // retry once permissions are restored.
+    let stacks = [];
+    try {
+      const stacksEtag = this._getCachedEtag(`stacks:${hydrated.id}`);
+      const stacksResp = await client.getStacks(hydrated.id, { etag: stacksEtag });
+      if (stacksResp.status === 304) {
+        // Stacks unchanged — reuse cached stacks (with embedded cards).
+        const cached = this.plugin.data.nextcloud[`_cachedStacks:${hydrated.id}`];
+        stacks = Array.isArray(cached) ? cached : [];
+        this.plugin.debugLog({ event: "sync.pull.stacks.304", boardId: hydrated.id, stackCount: stacks.length });
+      } else {
+        const stacksData = stacksResp.data;
+        stacks = Array.isArray(stacksData) ? stacksData : [];
+        this._setCachedEtag(`stacks:${hydrated.id}`, stacksResp.etag);
+        this.plugin.data.nextcloud[`_cachedStacks:${hydrated.id}`] = stacks;
+      }
+    } catch (error) {
+      this.plugin.pushSyncLog({ event: "stacks-fetch-failed", boardId: hydrated.id, message: (error && error.message) || String(error) });
+    }
     if (!localBoard) {
-      const { data: stacks } = await client.getStacks(hydrated.id);
-      const created = remoteBoardToLocal(hydrated, stacks || [], {
+      const created = remoteBoardToLocal(hydrated, stacks, {
         boardId: localBoardId,
         folderPath: this.suggestFolder(hydrated),
       });
       this.plugin.data.boards.push(created);
       this.mergeBoardLabelsIntoGlobal(created);
-      await this.pullCards(client, hydrated.id, created, stacks || []);
-      return stacks || [];
+      if (stacks.length) await this.pullCards(client, hydrated.id, created, stacks);
+      return stacks;
     }
 
-    const { data: stacks } = await client.getStacks(hydrated.id);
-    const reconciled = reconcileBoardStructure(localBoard, hydrated, stacks || []);
+    const reconciled = reconcileBoardStructure(localBoard, hydrated, stacks);
     const index = this.plugin.data.boards.indexOf(localBoard);
     this.plugin.data.boards[index] = reconciled;
     this.mergeBoardLabelsIntoGlobal(reconciled);
-    await this.pullCards(client, hydrated.id, reconciled, stacks || []);
-    return stacks || [];
+    if (stacks.length) await this.pullCards(client, hydrated.id, reconciled, stacks);
+    return stacks;
   }
 
   /**
@@ -6075,9 +6181,16 @@ class SyncManager {
     });
 
     // Track which lists were rebuilt so we can preserve the ordering of any
-    // local-only (unsynced) cards on the same list.
+    // local-only (unsynced) cards on the same list. Snapshot cardIds before
+    // clearing so a partial failure (stack missing from remoteStacks) can
+    // restore the previous state rather than orphaning remote-tracked cards.
     const rebuiltListIds = new Set();
-    localBoard.lists.forEach((list) => { rebuiltListIds.add(list.id); list.cardIds = []; });
+    const cardIdsSnapshot = new Map();
+    localBoard.lists.forEach((list) => {
+      rebuiltListIds.add(list.id);
+      cardIdsSnapshot.set(list.id, list.cardIds.slice());
+      list.cardIds = [];
+    });
 
     for (const stack of remoteStacks) {
       const localList = localBoard.lists.find((list) => list.remoteId === stack.id);
@@ -6091,7 +6204,7 @@ class SyncManager {
       for (const remoteCard of sorted) {
         const remoteIdKey = Number(remoteCard.id);
         const existing = cardMap.get(remoteIdKey);
-        const merged = mergeRemoteCardOntoLocal(existing, remoteCard, { boardId: localBoard.id, listId: localList.id });
+        const merged = mergeRemoteCardOntoLocal(existing, remoteCard, { boardId: localBoard.id, listId: localList.id, stackRemoteId: stack.id });
         const cardId = existing ? existing.id : merged.id;
         merged.id = cardId;
         merged.boardId = localBoard.id;
@@ -6139,6 +6252,25 @@ class SyncManager {
       }
     }
 
+    // Restore cardIds for lists whose stack was NOT present in remoteStacks
+    // (e.g. the bulk response omitted a stack, or the single-stack fallback
+    // also failed). Without this, remote-tracked cards on those lists would
+    // be orphaned — they'd remain in data.cards but vanish from every list,
+    // and the fold-back below only restores remoteId==null cards.
+    const processedListIds = new Set(
+      remoteStacks.map((s) => localBoard.lists.find((l) => l.remoteId === s.id))
+        .filter(Boolean)
+        .map((l) => l.id),
+    );
+    for (const list of localBoard.lists) {
+      if (processedListIds.has(list.id)) continue;
+      const snapshot = cardIdsSnapshot.get(list.id);
+      if (snapshot && snapshot.length) {
+        list.cardIds = snapshot.filter((id) => this.plugin.data.cards[id]);
+        this.plugin.debugLog({ event: "sync.pull.cardIds-restored", listId: list.id, count: list.cardIds.length });
+      }
+    }
+
     // Cards left in `cardMap` used to be on Nextcloud but no longer are; drop
     // them locally so Deck stays authoritative for tracked cards.
     cardMap.forEach((orphan) => {
@@ -6163,18 +6295,55 @@ class SyncManager {
     // board view (which reads from data.cards directly) shows the new
     // one. Best-effort per card; a single write failure shouldn't
     // abort the rest of the sync.
-    for (const card of dirtyForDisk) {
-      try {
-        await this.plugin.writeCardFile(card);
-      } catch (error) {
-        this.plugin.pushSyncLog({ event: "card-writeback-failed", cardId: card.id, message: (error && error.message) || String(error) });
+    // IMPORTANT: wrap in `reconciling` so the vault "modify" events
+    // triggered by writeCardFile are suppressed by queueCardFolderSync's
+    // `if (this.reconciling) return` guard. Without this, the 250ms
+    // debounce fires reconcileListsFromIndex against a STALE index.md
+    // (the index rewrite happens later in syncOnce), resurrecting deleted
+    // list UIDs — the "phantom lists" bug documented in AGENTS.md §5.1.
+    this.plugin.reconciling = true;
+    try {
+      for (const card of dirtyForDisk) {
+        try {
+          await this.plugin.writeCardFile(card);
+        } catch (error) {
+          this.plugin.pushSyncLog({ event: "card-writeback-failed", cardId: card.id, message: (error && error.message) || String(error) });
+        }
       }
+    } finally {
+      this.plugin.reconciling = false;
     }
   }
 
+  /**
+   * Fallback for when a stack's `cards` array is missing from the bulk
+   * `/boards/{id}/stacks` response (some Deck deployments omit embedded
+   * cards). Fetches the individual stack endpoint which typically includes
+   * cards. If that also fails (404 on Deck versions without the single-
+   * stack endpoint), returns [] and logs the failure so we don't silently
+   * wipe local cards.
+   */
   async fallbackFetchStackCards(client, boardId, stackId) {
-    this.plugin.pushSyncLog({ event: "stack-embed-missing", boardId, stackId });
-    return [];
+    try {
+      const stackEtag = this._getCachedEtag(`stack:${boardId}:${stackId}`);
+      const resp = await client.getStack(boardId, stackId, { etag: stackEtag });
+      if (resp.status === 304) {
+        // Stack unchanged — use cached cards if available.
+        const cached = this.plugin.data.nextcloud[`_cachedStackCards:${boardId}:${stackId}`];
+        return Array.isArray(cached) ? cached : [];
+      }
+      this._setCachedEtag(`stack:${boardId}:${stackId}`, resp.etag);
+      const stack = resp.data;
+      const cards = stack && Array.isArray(stack.cards) ? stack.cards : [];
+      this.plugin.data.nextcloud[`_cachedStackCards:${boardId}:${stackId}`] = cards;
+      if (!cards.length) {
+        this.plugin.pushSyncLog({ event: "stack-embed-empty", boardId, stackId });
+      }
+      return cards;
+    } catch (error) {
+      this.plugin.pushSyncLog({ event: "stack-embed-missing", boardId, stackId, message: (error && error.message) || String(error) });
+      return [];
+    }
   }
 
   // ---- Push ---------------------------------------------------------------
@@ -6205,6 +6374,22 @@ class SyncManager {
           pushed += 1;
           continue;
         }
+        // Detect local card moves across stacks. Deck's PUT endpoint doesn't
+        // change a card's stack — that requires a separate `reorderCard` call.
+        // Compare the stack remoteId recorded in the baseline (set after the
+        // last successful pull/push) with the card's current list binding.
+        const baselineStack = card.baseline && card.baseline.stackRemoteId;
+        if (baselineStack != null && baselineStack !== listBinding.remoteId) {
+          try {
+            await client.reorderCard(remoteBoard(localBoard), baselineStack, card.remoteId, {
+              targetStackId: listBinding.remoteId,
+              order: typeof card.position === "number" ? card.position : 0,
+            });
+            this.plugin.debugLog({ event: "sync.push.reorder", cardId: card.id, from: baselineStack, to: listBinding.remoteId });
+          } catch (reorderError) {
+            this.plugin.pushSyncLog({ event: "push-reorder-failed", cardId: card.id, message: (reorderError && reorderError.message) || String(reorderError) });
+          }
+        }
         const remoteSnapshot = remoteCardIndex.get(card.remoteId);
         const outcome = await this.pushUpdate(client, localBoard, listBinding, card, remoteSnapshot, policy);
         if (outcome === "pushed") pushed += 1;
@@ -6216,6 +6401,13 @@ class SyncManager {
           message: (error && error.message) || String(error),
         });
       }
+    }
+
+    // P2-1: After a successful push, invalidate the board's etag cache so
+    // the next pull fetches fresh data instead of relying on a stale 304.
+    if (pushed > 0) {
+      const boardRemoteId = localBoard.remoteId;
+      if (boardRemoteId != null) this._invalidateBoardEtags(boardRemoteId);
     }
 
     return { pushed, conflicts };
@@ -6239,7 +6431,7 @@ class SyncManager {
     const { data: created } = await client.createCard(remoteBoard(localBoard), list.remoteId, payload);
     if (!created) throw new Error("Empty response from createCard");
     this.plugin.debugLog({ event: "sync.push.create.done", cardId: card.id, remoteId: created.id });
-    this.applyRemoteToCard(card, created, localBoard.id, list.id);
+    this.applyRemoteToCard(card, created, localBoard.id, list.id, list.remoteId);
     card.localDirty = false;
     await this.attachments.pushCard(client, card, localBoard, list).catch((error) => {
       this.plugin.pushSyncLog({ event: "attachment-push-failed", cardId: card.id, message: (error && error.message) || String(error) });
@@ -6262,7 +6454,7 @@ class SyncManager {
     if (rewritten && rewritten !== payload.description) {
       try {
         const { data: updated } = await client.updateCard(remoteBoard(localBoard), list.remoteId, card.remoteId, Object.assign({}, payload, { description: rewritten }));
-        if (updated) this.applyRemoteToCard(card, updated, localBoard.id, list.id);
+        if (updated) this.applyRemoteToCard(card, updated, localBoard.id, list.id, list.remoteId);
         this.plugin.debugLog({ event: "sync.push.create.attachment-links-rewritten", cardId: card.id });
       } catch (error) {
         this.plugin.pushSyncLog({ event: "attachment-link-rewrite-failed", cardId: card.id, message: (error && error.message) || String(error) });
@@ -6277,7 +6469,7 @@ class SyncManager {
       return "pushed";
     }
 
-    const remoteView = remoteCardToLocal(remoteSnapshot, { boardId: localBoard.id, listId: list.id });
+    const remoteView = remoteCardToLocal(remoteSnapshot, { boardId: localBoard.id, listId: list.id, stackRemoteId: list.remoteId });
     const baseline = card.baseline || null;
     const diff = detectFieldConflicts(baseline, card, remoteView);
 
@@ -6340,7 +6532,7 @@ class SyncManager {
     const { data: updated } = await client.updateCard(board, list.remoteId, card.remoteId, payload);
     if (!updated) throw new Error("Empty response from updateCard");
     this.plugin.debugLog({ event: "sync.push.update.done", cardId: card.id, remoteId: card.remoteId });
-    this.applyRemoteToCard(card, updated, localBoard.id, list.id);
+    this.applyRemoteToCard(card, updated, localBoard.id, list.id, list.remoteId);
     card.localDirty = false;
     await this.pushCardLabels(client, localBoard, list, card).catch((error) => {
       this.plugin.pushSyncLog({ event: "labels-push-failed", cardId: card.id, message: (error && error.message) || String(error) });
@@ -6348,15 +6540,15 @@ class SyncManager {
     return "pushed";
   }
 
-  applyRemoteToCard(card, remoteResp, boardId, listId) {
-    const remote = remoteCardToLocal(remoteResp, { boardId, listId });
+  applyRemoteToCard(card, remoteResp, boardId, listId, stackRemoteId) {
+    const remote = remoteCardToLocal(remoteResp, { boardId, listId, stackRemoteId });
     card.remoteId = remote.remoteId;
     card.etag = remote.etag;
     card.remoteUpdatedAt = remote.remoteUpdatedAt;
     // After a successful push, the *local* state is now the truth for the
     // baseline. Fields we didn't touch on Deck (checklist etc.) came back
     // unchanged, so hashing what we have is safe.
-    card.baseline = snapshotBaseline(card);
+    card.baseline = snapshotBaseline(card, { stackRemoteId });
   }
 
   /**
@@ -6872,9 +7064,13 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
   }
 
   async savePluginData() {
-    await this.writeBoardIndexFiles();
-    await this.syncGraphColorGroups();
+    // Persist data.json FIRST so in-memory state is never lost if a
+    // subsequent best-effort step (index files, graph colours) throws.
+    // Pre-fix: writeBoardIndexFiles ran first and a vault write failure
+    // there skipped saveData entirely, losing fresh pull data on reload.
     await this.saveData(this.data);
+    try { await this.writeBoardIndexFiles(); } catch (error) { console.error("Task Deck: board index write failed", error); }
+    try { await this.syncGraphColorGroups(); } catch (error) { /* non-critical */ }
   }
 
   // Nextcloud helpers -------------------------------------------------------

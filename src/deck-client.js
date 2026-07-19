@@ -82,6 +82,20 @@ class DeckClient {
     return this.request({ method: "GET", path: `/boards/${encodeURIComponent(boardId)}/stacks`, etag });
   }
 
+  /**
+   * Fetch a single stack with its embedded cards. Used as a fallback when
+   * the bulk `/stacks` response omits the `cards` array on some Deck
+   * deployments. Not all Deck versions expose this endpoint; callers should
+   * handle 404 gracefully.
+   */
+  getStack(boardId, stackId, { etag } = {}) {
+    return this.request({
+      method: "GET",
+      path: `/boards/${encodeURIComponent(boardId)}/stacks/${encodeURIComponent(stackId)}`,
+      etag,
+    });
+  }
+
   createStack(boardId, { title, order }) {
     const body = { title };
     if (order !== undefined) body.order = order;

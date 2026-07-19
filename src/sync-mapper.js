@@ -72,7 +72,7 @@ function mergeDetailsAndChecklist(details, checklist) {
  * preserved as-is (uid + display name) so future team support can round-trip
  * cleanly, but the MVP UI won't render them.
  */
-function remoteCardToLocal(remoteCard, { boardId, listId }) {
+function remoteCardToLocal(remoteCard, { boardId, listId, stackRemoteId } = {}) {
   if (!remoteCard) return null;
   const labels = Array.isArray(remoteCard.labels)
     ? remoteCard.labels.map((label) => ({
@@ -126,7 +126,7 @@ function remoteCardToLocal(remoteCard, { boardId, listId }) {
   const split = splitDescriptionWithChecklist(card.details);
   card.details = split.details;
   card.checklist = split.checklist;
-  card.baseline = snapshotBaseline(card);
+  card.baseline = snapshotBaseline(card, { stackRemoteId });
   return card;
 }
 
@@ -135,8 +135,8 @@ function remoteCardToLocal(remoteCard, { boardId, listId }) {
  * user hasn't touched locally (`localDirty === false`) are overwritten; the
  * local id and file path are preserved so vault notes don't churn.
  */
-function mergeRemoteCardOntoLocal(existing, remoteCard, { boardId, listId }) {
-  const remote = remoteCardToLocal(remoteCard, { boardId, listId });
+function mergeRemoteCardOntoLocal(existing, remoteCard, { boardId, listId, stackRemoteId } = {}) {
+  const remote = remoteCardToLocal(remoteCard, { boardId, listId, stackRemoteId });
   if (!existing) return remote;
 
   const merged = { ...existing };

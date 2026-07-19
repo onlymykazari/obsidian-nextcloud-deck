@@ -105,8 +105,12 @@ function applyPolicy(policy, conflicts, { localUpdatedAt, remoteUpdatedAt } = {}
  * we can conflict-merge are captured; labels and assignees are recorded as a
  * shallow signature so we can still detect that they moved (without having to
  * store the whole array in data.json).
+ *
+ * `stackRemoteId` is optional — the sync manager sets it after pull/push so
+ * that the next push can detect local card moves across stacks (Deck requires
+ * a separate `reorderCard` call for that, not covered by the PUT endpoint).
  */
-function snapshotBaseline(card) {
+function snapshotBaseline(card, { stackRemoteId } = {}) {
   if (!card) return null;
   return {
     title: card.title || "",
@@ -115,6 +119,7 @@ function snapshotBaseline(card) {
     dueDate: card.dueDate || "",
     startDate: card.startDate || "",
     labelsSignature: signatureOfLabels(card.labels),
+    stackRemoteId: stackRemoteId != null ? Number(stackRemoteId) : null,
   };
 }
 

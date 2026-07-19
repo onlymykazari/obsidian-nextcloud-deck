@@ -298,9 +298,13 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
   }
 
   async savePluginData() {
-    await this.writeBoardIndexFiles();
-    await this.syncGraphColorGroups();
+    // Persist data.json FIRST so in-memory state is never lost if a
+    // subsequent best-effort step (index files, graph colours) throws.
+    // Pre-fix: writeBoardIndexFiles ran first and a vault write failure
+    // there skipped saveData entirely, losing fresh pull data on reload.
     await this.saveData(this.data);
+    try { await this.writeBoardIndexFiles(); } catch (error) { console.error("Task Deck: board index write failed", error); }
+    try { await this.syncGraphColorGroups(); } catch (error) { /* non-critical */ }
   }
 
   // Nextcloud helpers -------------------------------------------------------
